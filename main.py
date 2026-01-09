@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from tool import logger
 import uvicorn
 from dotenv import load_dotenv
 import math
@@ -9,14 +10,15 @@ from document import extract_document_info, analysis_document
 from main_chat import cosine_similarity, make_context_from_hits, build_rag_prompt, create_embedding, chat_answer, generate_title_from_messages
 import json
 
+
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ★ 모든IP 허용
-    allow_credentials=True, # 쿠키 기반 인증
-    allow_methods=["*"],     # 필요에 따라 ["GET","POST"] 등으로 제한 가능
-    allow_headers=["*"],     # 필요에 따라 ["Authorization","Content-Type"] 등으로 제한 가능
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # =========================
@@ -58,12 +60,13 @@ class TitleRequest(BaseModel):
 class TitleResponse(BaseModel):
     title: str
 
+class AnalyzeRequest(BaseModel):
+    image_path: str
 
-@app.get("/")  # http://localhost:8000
-def hello():
-    return {"hello": "FastAPI"}
+
 
 @app.post("/document/analyze")
+
 async def analyze_document(request: Request):
     data = await request.json()
     image_path = data.get("image_path")
@@ -131,14 +134,14 @@ def make_title(req: TitleRequest):
   
 
 
+=======
+async def analyze_document_endpoint(req: AnalyzeRequest):
+    try:
+        result = analyze_document(req.image_path)
+        return {"analysis": result}
+    except Exception as e:
+        logger.error("문서 분석 실패", exc_info=e)
+        raise HTTPException(status_code=500, detail="문서 분석 실패")
+>>>>>>> f39006a63b7fe50d86f48d8570bb1262e6e4e460
 if __name__ == "__main__":
-    # main.py 파일명:FastAPI 객체 app 변수
-    # host="0.0.0.0": 접속 가능 컴퓨터
-    # reload=True: 소스 변경시 자동 재시작
     uvicorn.run("main:app", host="0.0.0.0", reload=True)
-
-
-'''
-(base) activate ai
-(ai) python main.py
-'''
