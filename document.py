@@ -1,56 +1,100 @@
-import streamlit as st
-from openai import OpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langchain_openai import ChatOpenAI
 import base64
 import json
-import tempfile
-import os
-
-# -----------------------------
-# 기본 설정
-# -----------------------------
-st.set_page_config(page_title="홈스캐너 문서 AI", layout="centered")
-st.title("🏠 홈스캐너 문서 AI")
-st.write("문서 이미지를 업로드하면 AI가 내용을 이해하고 핵심 정보를 추출합니다.")
+from openai import OpenAI
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage
+from tool import logger
+from db import SessionLocal
+from risk.contract_risk_policy import get_active_policy
+from risk.contract_risk_rule import get_active_rules
 
 client = OpenAI()
-# -----------------------------
-# 유틸 함수
-# -----------------------------
-def encode_image(path):
+
+
+# -------------------------------------------------
+# 이미지 → base64
+# -------------------------------------------------
+def encode_image(path: str) -> str:
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
 
-def extract_document_info(image_path):
+# -------------------------------------------------
+# Vision OCR + 구조화
+# -------------------------------------------------
+def parsing_document_info(image_path: str) -> dict:
     img_base64 = encode_image(image_path)
 
-    prompt = """
-너는 API 서버다.
-반드시 JSON만 반환해야 한다.
-설명, 주석, 문장, ``` 절대 포함하지 마라.
-이미지 분석해서 텍스트 추출에 집중해라.
-순위 번호별로 모두 반환해라.
-없는 항목은 -1로 반환하라.
+    # -------------------------------
+    # System 프롬프트 (형식 강제)
+    # -------------------------------
+    system_prompt = """
+너는 등기 및 권리관계 문서 이미지에서 정보를 추출해
+오직 JSON 객체 1개만 출력하는 OCR 파서다.
 
-형식:
-{
-  "주택임차권": "...",
-  "압류": "...",
-  "가압류": "..."
-}
-
-문서 분석을 수행하라.
+절대 규칙:
+- JSON 외 텍스트(설명, 문장, 주석, 마크다운, ```) 금지
+- 키 누락, 추가, 이름 변경 금지
+- 값은 JSON 값만 사용 (true/false/null/number/string/object/array)
+- 불확실하거나 이미지에 없으면 null
+- 추측, 법적 판단, 요약, 해석 금지
 """
 
+    # -------------------------------
+    # User 프롬프트 (유효 JSON 스켈레톤)
+    # -------------------------------
+    user_prompt = """
+아래 이미지에서 명시적으로 확인되는 사실만 추출하라.
+
+반환은 반드시 아래 JSON 스켈레톤을 그대로 사용하라.
+JSON 외의 어떤 문자도 출력하지 마라.
+
+{
+  "임차권": {
+    "exists": false,
+    "is_prior": null,
+    "deposit": null
+  },
+  "압류": {
+    "exists": false,
+    "type": null,
+    "count": null
+  },
+  "가압류": {
+    "exists": false,
+    "amount": null
+  },
+  "근저당": {
+    "exists": false,
+    "max_amount": null
+  },
+  "신탁": {
+    "exists": false
+  },
+  "meta": {
+    "uncertain_fields": []
+  }
+}
+
+추가 규칙:
+- exists / is_prior 는 true 또는 false만 사용
+- 금액, 개수는 숫자만 사용 (원, 콤마, 문자 금지)
+- type 은 "국세" | "지방세" | "기타" 중 하나만 사용, 불명확하면 null
+- 확신이 낮은 필드는 meta.uncertain_fields 에 필드 경로 문자열로 추가
+"""
+
+    # -------------------------------
+    # Vision 호출 (JSON mode)
+    # -------------------------------
     response = client.chat.completions.create(
         model="gpt-4o-mini",
+        response_format={"type": "json_object"},
         messages=[
+            {"role": "system", "content": system_prompt.strip()},
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": user_prompt.strip()},
                     {
                         "type": "image_url",
                         "image_url": {
@@ -60,78 +104,172 @@ def extract_document_info(image_path):
                 ]
             }
         ],
-        max_tokens=800
+        temperature=0,
+        max_tokens=1200
     )
 
-    return response.choices[0].message.content
+    raw = response.choices[0].message.content.strip()
 
-def analysis_document(data: dict):
+    # -------------------------------
+    # 1차 파싱
+    # -------------------------------
+    try:
+        return json.loads(raw)
+
+    except json.JSONDecodeError:
+        logger.error("Vision JSON 파싱 실패 (1차)", extra={"raw": raw})
+
+        # -------------------------------
+        # 리페어 1회 재시도
+        # -------------------------------
+        repair_prompt = f"""
+아래 출력은 JSON 형식 위반이다.
+오직 유효한 JSON 객체 1개로만 고쳐라.
+
+규칙:
+- JSON 외 텍스트 금지
+- 키는 스켈레톤과 동일
+- 불확실하면 null
+
+원본 출력:
+{raw}
+"""
+
+        repair_resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "너는 JSON 수리기다. JSON만 출력하라."},
+                {"role": "user", "content": repair_prompt.strip()},
+            ],
+            temperature=0,
+            max_tokens=800
+        )
+
+        repaired_raw = repair_resp.choices[0].message.content.strip()
+
+        try:
+            return json.loads(repaired_raw)
+        except json.JSONDecodeError:
+            logger.error(
+                "Vision JSON 파싱 실패 (리페어 후)",
+                extra={"raw": raw, "repaired": repaired_raw}
+            )
+            raise ValueError("Vision AI JSON 파싱 실패")
+
+
+# -------------------------------------------------
+# 위험 점수 계산 (DB 룰 기반)
+# -------------------------------------------------
+def calculate_risk_score(parsed_data: dict, rules):
+    total_score = 0
+    reasons = []
+
+    for rule in rules:
+        if rule.category == "임차권":
+            lease = parsed_data.get("임차권", {})
+
+            if rule.rule_key == "exists" and lease.get("exists"):
+                total_score += rule.score
+                reasons.append(rule.description)
+
+            if rule.rule_key == "not_prior" and lease.get("is_prior") is False:
+                total_score += rule.score
+                reasons.append(rule.description)
+
+        elif rule.category == "압류":
+            arrest = parsed_data.get("압류", {})
+
+            if rule.rule_key == "exists" and arrest.get("exists"):
+                total_score += rule.score
+                reasons.append(rule.description)
+
+            if rule.rule_key == "multiple" and (arrest.get("count") or 0) >= 2:
+                total_score += rule.score
+                reasons.append(rule.description)
+
+        elif rule.category == "가압류":
+            if parsed_data.get("가압류", {}).get("exists"):
+                total_score += rule.score
+                reasons.append(rule.description)
+
+        elif rule.category == "근저당":
+            if parsed_data.get("근저당", {}).get("exists"):
+                total_score += rule.score
+                reasons.append(rule.description)
+
+    return total_score, reasons
+
+
+# -------------------------------------------------
+# AI 설명 생성 (설명만!)
+# -------------------------------------------------
+def generate_ai_explanation(score: int, reasons: list, policy_version: str) -> str:
     llm = ChatOpenAI(model="gpt-4o-mini")
 
-    prompt = (
-        "너는 부동산 전세사기 위험도를 분석하는 전문가 AI야.\n\n"
-        "아래 등기부 등본 분석 데이터를 근거로 전세사기 위험도를 평가해라.\n"
-        "-1은 해당 항목이 없다는 뜻이다.\n\n"
-        "출력 형식은 반드시 아래를 지켜라:\n\n"
-        "위험도: XX%\n\n"
-        "근거:\n"
-        "- 근거1\n"
-        "- 근거2\n"
-        "- 근거3 (있을 경우)\n\n"
-        "데이터:\n"
-        f"{json.dumps(data, ensure_ascii=False, indent=2)}"
-    )
+    prompt = f"""
+너는 전세계약 위험도 결과를 설명하는 AI다.
+새로운 판단이나 점수 계산을 절대 하지 마라.
 
-    messages = [SystemMessage(content=prompt)]
-    resp = llm.invoke(messages)
+[정책 버전]
+{policy_version}
+
+[위험 점수]
+{score}점
+
+[판단 근거]
+{chr(10).join(f"- {r}" for r in reasons)}
+"""
+
+    resp = llm.invoke([SystemMessage(content=prompt)])
     return resp.content
 
 
-# -----------------------------ㄴ
-# UI 영역
-# -----------------------------
-uploaded_file = st.file_uploader(
-    "📄 문서 이미지 업로드 (jpg / png)",
-    type=["jpg", "jpeg", "png"]
-)
+# -------------------------------------------------
+# 최종 진입 함수 
+# -------------------------------------------------
+def analyze_document(image_path: str) -> dict:
+    db = SessionLocal()
+    print("① DB 세션 생성 완료")
 
-if uploaded_file:
-    st.image(uploaded_file, caption="업로드한 문서", use_container_width=True)
+    try:
+        print("② 정책 조회 시작")
+        policy = get_active_policy(db)
+        print("② 정책 조회 결과:", policy)
 
-    if st.button("🔍 문서 분석하기"):
-        with st.spinner("문서를 분석 중입니다..."):
-            # 임시 파일 저장
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-                tmp.write(uploaded_file.read())
-                tmp_path = tmp.name
+        if not policy:
+            raise ValueError("활성 정책이 없습니다.")
 
-            try:
-                result = extract_document_info(tmp_path)
+        print("③ 룰 조회 시작")
+        rules = get_active_rules(db, policy.id)
+        print("③ 룰 개수:", len(rules))
 
-                st.subheader("📊 전세사기 위험도 분석")
-                
-                # JSON 파싱 시도
-                try:
-                    parsed = json.loads(result)
-                    analysis = analysis_document(parsed)
-                    st.markdown(analysis)
-                except json.JSONDecodeError:
-                    st.warning("JSON 파싱 실패 – 원본 응답을 표시합니다")
-                    st.text(result)
+        print("④ Vision 파싱 시작")
+        parsed_data = parsing_document_info(image_path)
+        print("④ Vision 파싱 결과:", parsed_data)
 
-            finally:
-                os.remove(tmp_path)
+        print("⑤ 점수 계산 시작")
+        score, reasons = calculate_risk_score(parsed_data, rules)
+        print("⑤ 점수:", score, "사유:", reasons)
 
-# -----------------------------
-# 하단 안내
-# -----------------------------
-st.markdown("---")
-st.markdown("""
-### ℹ️ 사용 방법
-1. 계약서 / 고지서 / 공문 이미지를 업로드
-2. **문서 분석하기** 버튼 클릭
+        print("⑥ AI 설명 생성 시작")
+        explanation = generate_ai_explanation(score, reasons, policy.version)
+        print("⑥ AI 설명 완료")
 
-> OpenCV, OCR 설치 없이 Vision AI만 사용합니다.
-""")
+        return {
+            "policy_version": policy.version,
+            "risk_score": score,
+            "reasons": reasons,
+            "ai_explanation": explanation,
+            "parsed_data": parsed_data
+        }
 
-#python -m streamlit run document_streamlit.py
+    except Exception as e:
+        print("💥 EXCEPTION TYPE:", type(e))
+        print("💥 EXCEPTION MSG:", e)
+        logger.error("문서 분석 실패", exc_info=True)
+        raise
+
+    finally:
+        print("⑦ DB 세션 종료")
+        db.close()
