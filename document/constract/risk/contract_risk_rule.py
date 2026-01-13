@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session
-from risk.contract_risk import ContractRiskRule
+from document.risk.contract_risk import ContractRiskRule
 
 def get_active_rules(db: Session, policy_id: int) -> list[ContractRiskRule]:
     rules = (
