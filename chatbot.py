@@ -1,4 +1,4 @@
-# main_chat.py
+# chatbot.py
 import os
 import math
 import json
@@ -327,9 +327,6 @@ def chroma_add_docs(
     chunk_size: int = 900,
     overlap: int = 120,
 ) -> int:
-    """
-    docs item: { id: str|None, text: str, meta: dict|None }
-    """
     ids: List[str] = []
     documents: List[str] = []
     metadatas: List[Dict[str, Any]] = []
@@ -340,7 +337,17 @@ def chroma_add_docs(
     for d in docs:
         base_id = d.get("id") or "doc"
         text = d.get("text") or ""
-        meta = d.get("meta") or {}
+
+        # ✅ meta는 복사본으로 + 필터키는 문자열 통일 권장
+        meta = dict(d.get("meta") or {})
+        if "user_id" in meta and meta["user_id"] is not None:
+            meta["user_id"] = str(meta["user_id"])
+        if "doc_id" in meta and meta["doc_id"] is not None:
+            meta["doc_id"] = str(meta["doc_id"])
+        if "doc_type" in meta and meta["doc_type"] is not None:
+            meta["doc_type"] = str(meta["doc_type"])
+        if "stage" in meta and meta["stage"] is not None:
+            meta["stage"] = str(meta["stage"])
 
         pieces = [text]
         if chunk:
@@ -350,10 +357,14 @@ def chroma_add_docs(
             p = (p or "").strip()
             if not p:
                 continue
+
             cid = stable_id(base_id, f"{i}:{p}")
             ids.append(cid)
             documents.append(p)
-            metadatas.append(meta)
+
+            # ✅ chunk마다 meta dict 복사해서 넣기(안전)
+            metadatas.append(dict(meta))
+
             embeddings.append(create_embedding(p))
             inserted += 1
 
@@ -367,32 +378,42 @@ def chroma_add_docs(
 
     return inserted
 
+
 def chroma_search(
     query_embedding: List[float],
     top_k: int = 5,
     doc_type: Optional[str] = None,
     stage: Optional[str] = None,
+    user_id: Optional[str] = None,   # ✅ 추가
+    doc_id: Optional[str] = None,    # ✅ 추가
 ) -> List[Dict[str, Any]]:
     """
     return hits: [{"id","text","meta","score"}...]
     score는 (1 - distance) 형태로 근사 (높을수록 유사)
     """
     where = {}
+
     if doc_type is not None:
-        where["doc_type"] = doc_type
+        where["doc_type"] = str(doc_type)
     if stage is not None:
-        where["stage"] = stage
+        where["stage"] = str(stage)
+
+    # ✅ B안: 특정 사용자/특정 문서로 제한
+    if user_id is not None:
+        where["user_id"] = str(user_id)
+    if doc_id is not None:
+        where["doc_id"] = str(doc_id)
+
     if not where:
         where = None
 
     include = ["documents", "metadatas", "distances"]
     res = _chroma_col.query(
-      query_embeddings=[query_embedding],
-      n_results=top_k,
-      where=where,
-      include=include,
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        where=where,
+        include=include,
     )
-
 
     ids = (res.get("ids") or [[]])[0]
     docs = (res.get("documents") or [[]])[0]
@@ -409,6 +430,5 @@ def chroma_search(
             "score": score
         })
 
-    # score 내림차순 정렬(안전)
     hits.sort(key=lambda x: x["score"], reverse=True)
     return hits
