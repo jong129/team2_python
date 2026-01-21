@@ -272,3 +272,32 @@ def analyze_document(image_path: str) -> Dict[str, Any]:
     except Exception:
         logger.error("문서 분석 실패", exc_info=True, extra={"image_path": image_path})
         raise
+
+
+
+# -------------------------------------------------
+# 챗봇 연동
+# -------------------------------------------------
+def analyze_document_b64(img_b64: str) -> Dict[str, Any]:
+    images_b64 = [img_b64]
+
+    cls = classify_document_with_override(img_b64)
+    doc_type = cls.doc_type
+
+    if doc_type == DocType.UNKNOWN:
+        raise ValueError("문서 타입을 분류할 수 없습니다.")
+
+    score, reasons, policy_version, parsed_data = analyze_registry(images_b64)
+    explanation = generate_ai_explanation(score, reasons, policy_version)
+
+    return {
+        "doc_type": doc_type.value,
+        "policy_version": policy_version,
+        "risk_score": score,
+        "reasons": reasons,
+        "ai_explanation": explanation,
+        "doc_confidence": cls.confidence,
+        "doc_evidence": cls.evidence,
+        "override_reason": cls.override_reason,
+        "parsed_data": parsed_data,
+    }
