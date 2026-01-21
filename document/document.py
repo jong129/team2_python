@@ -10,6 +10,7 @@ from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage
 
+from document.constract.contract import analyze_contract
 from document.registry.registry import analyze_registry
 from tool import logger
 
@@ -249,8 +250,10 @@ def analyze_document(image_path: str) -> Dict[str, Any]:
 
         # 일단 지금은 전부 analyze_registry로 보내고 있는데,
         # 추후 doc_type별로 analyze_registry/analyze_contract/analyze_building으로 분기하면 됨.
-        score, reasons, policy_version, parsed_data = analyze_registry(images_b64)
-
+        if doc_type == DocType.CONTRACT:
+            score, reasons, policy_version, parsed_data = analyze_contract(images_b64)
+        elif doc_type == DocType.REGISTRY:
+            score, reasons, policy_version, parsed_data = analyze_registry(images_b64)
         explanation = generate_ai_explanation(score, reasons, policy_version)
 
         return {

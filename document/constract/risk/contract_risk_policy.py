@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session
-from document.risk.contract_risk import ContractRiskPolicy
+from document.constract.risk.contract_risk import ContractRiskPolicy
 
 
 def get_active_policy(db: Session) -> ContractRiskPolicy:
