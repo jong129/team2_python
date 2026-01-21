@@ -1,4 +1,5 @@
 # main_checklist.py
+# 혹시 몰라서 냅둠
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
