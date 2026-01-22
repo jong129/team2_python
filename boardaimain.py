@@ -306,7 +306,7 @@ def board_moderate_image(req: BoardAiImageRequest):
   - OTHER: 기타 부적절(사칭/불법/불쾌한 장면 등)
 - 애매하면 allowed=false(보수적)로 판단한다.
 - score는 판단 확신도(0.0~1.0).
-
+- 한국 영상물 등급 심의 기준 15세 이하의 수준까지는 인정
 출력 규칙(절대 준수):
 - 반드시 JSON 한 줄만 출력한다. 다른 텍스트 금지.
 - 키 이름 고정:
