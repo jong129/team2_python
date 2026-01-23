@@ -29,7 +29,8 @@ from chatbot import (
 # =========================
 from checklist.checklist_rag import ChecklistRagService
 from checklist.checklist_scoring import ChecklistScoringService
-
+from checklist.checklist_summary import ChecklistSummaryService
+from checklist.checklist_review import ChecklistReviewService, PostChecklistReviewRequest
 
 load_dotenv()
 
@@ -53,7 +54,8 @@ checklist_rag_service = ChecklistRagService(
 )
 
 checklist_scoring_service = ChecklistScoringService(checklist_rag_service)
-
+checklist_summary_service = ChecklistSummaryService()
+checklist_review_service = ChecklistReviewService(scoring_service=checklist_scoring_service)
 
 # =========================
 # Pydantic Models : 요청/응답의 스키마
@@ -164,6 +166,7 @@ class ChecklistScoreRequest(BaseModel):
 
 class ChecklistScoreResult(BaseModel):
     itemId: int
+    title: str
     importanceScore: float
     reason: str
 
@@ -241,8 +244,6 @@ def call_llm_for_summary(comments: List[str]) -> dict:
             "negative": [],
             "suggestions": ["요약 생성 실패"]
         }
-
-
 
 # =========================
 # Routes
@@ -503,6 +504,66 @@ def checklist_score(req: ChecklistScoreRequest):
     return ChecklistScoreResponse(
         scores=result.get("scores", [])
     )
+
+@app.get("/checklists/pre/session/{session_id}/result")
+def get_pre_checklist_result(session_id: int):
+    # 1️⃣ 미이행 항목 조회
+    not_done_items = ...
+
+    # 2️⃣ PDF 기반 AI 스코어링
+    score_result = checklist_scoring_service.score_items(not_done_items)
+
+    total_score = sum(s["importanceScore"] for s in score_result["scores"])
+
+    # 3️⃣ 중요도 상위 3개 추출
+    top_reasons = (
+        sorted(
+            score_result["scores"],
+            key=lambda x: x["importanceScore"],
+            reverse=True
+        )[:3]
+    )
+
+    # 4️⃣ 사용자 요약 생성 (summary 서비스 사용)
+    summary = checklist_summary_service.summarize_pre_result(
+        risk_score=total_score,
+        reasons=[r["reason"] for r in top_reasons]
+    )
+
+    return {
+        "riskScore": total_score,
+        "summary": summary["summary"],
+        "actions": summary["actions"],
+        "topReasons": top_reasons,
+        "allReasons": score_result["scores"]
+    }
+
+@app.post("/checklists/post/review")
+def review_post_checklist(req: PostChecklistReviewRequest):
+    """
+    POST 체크리스트 현재 상태 AI 리뷰
+    - Spring 서버가 NOT_DONE 항목을 전달
+    """
+
+    # NOT_DONE 항목 dict로 변환
+    not_done_items = [
+        {
+            "itemId": item.itemId,
+            "title": item.title,
+            "description": item.description
+        }
+        for item in req.notDoneItems
+    ]
+
+    return checklist_review_service.review_post_status(
+        not_done_items=not_done_items,
+        total=req.total,
+        done=req.done
+    )
+
+
+
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", reload=True)
