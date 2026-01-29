@@ -15,6 +15,15 @@ from openai import OpenAI
 # Chroma (Persistent)
 import chromadb
 
+# ✅ (선택) 로깅: tool.logger가 있으면 사용, 없으면 std logging fallback
+try:
+    from tool import logger  # type: ignore
+except Exception:
+    import logging
+    logger = logging.getLogger("chatbot")
+    if not logger.handlers:
+        logging.basicConfig(level=logging.INFO)
+
 # ================================
 # 설계 의도 : 
 # ChromaDB를 로컬 영속 저장소로 사용해서 문서 chunk 임베딩을 누적 관리한다.
@@ -30,10 +39,10 @@ client = OpenAI()
 # =========================
 # Chroma 설정
 # =========================
-CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma_db") # 디스크에 저장되는 ChromaDB 폴더 (persistent)
-CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "real_estate")   # Chroma 안에서 테이블 같은 논리 단위
+CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma_db")  # 디스크에 저장되는 ChromaDB 폴더 (persistent)
+CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "real_estate")  # Chroma 안에서 테이블 같은 논리 단위
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 텍스트 -> 벡터 모델
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini") # 답변 생성 모델
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")  # 답변 생성 모델
 
 _chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
 _chroma_col = _chroma_client.get_or_create_collection(name=CHROMA_COLLECTION)
@@ -44,7 +53,7 @@ _chroma_col = _chroma_client.get_or_create_collection(name=CHROMA_COLLECTION)
 def _norm_text(s: str) -> str:  # 공백/줄바꿈을 한 칸 공백으로 통일
     return " ".join((s or "").strip().split())
 
-def stable_id(prefix: str, text: str) -> str:   # chunk마다 중복 방지용 고정 ID 생성
+def stable_id(prefix: str, text: str) -> str:  # chunk마다 중복 방지용 고정 ID 생성
     h = hashlib.sha1(_norm_text(text).encode("utf-8")).hexdigest()[:16]
     return f"{prefix}_{h}"
 
@@ -76,29 +85,29 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 120) -> List[str
             chunks.append(chunk)
         if end >= n:
             break
-    # overlap : 문장/문단 경계가 잘리는 걸 줄이고 중요한 문맥이 다음 chunk로 이어지게 해서 검색 품질을 올림
-        start = max(0, end - overlap)   
+        # overlap : 문장/문단 경계가 잘리는 걸 줄이고 중요한 문맥이 다음 chunk로 이어지게 해서 검색 품질을 올림
+        start = max(0, end - overlap)
     return chunks
 
 # =========================
 # Embedding + 캐시
 # =========================
 @lru_cache(maxsize=20000)
-def _embed_cached(text: str) -> Tuple[float, ...]:  # 같은 텍스트는 embedding을 다시 호출하지 않음
+def _embed_cached(text: str) -> Tuple[float, ...]:
     t = _norm_text(text)
     if not t:
-        return tuple() # 반환을 tuple로 하는 이유 : lru_cache는 리스트 같은 mutable 타입을 키/값으로 쓰기 불편
+        return tuple()
     r = client.embeddings.create(model=EMBED_MODEL, input=t)
     return tuple(r.data[0].embedding)
 
-def create_embedding(text: str) -> List[float]: # tuple -> list로 변환해 Chroma에 넣게 편하게 만듬
+def create_embedding(text: str) -> List[float]:
     return list(_embed_cached(text))
 
 # =========================
 # RAG Context : 검색된 hit들의 text를 - ... 형태로 붙여서 컨텍스트 구성
 # =========================
 def make_context_from_hits(hits: List[Dict[str, Any]], max_chars: int = 3500) -> str:
-    chunks, total = [], 0                              # max_chars로 길이 제한 (모델 토큰 초과 방지)
+    chunks, total = [], 0
     for h in hits:
         t = (h.get("text") or "").strip()
         if not t:
@@ -112,13 +121,13 @@ def make_context_from_hits(hits: List[Dict[str, Any]], max_chars: int = 3500) ->
 
 # =========================
 # 질문 분류 : simple vs analysis
-# =========================  
+# =========================
 def classify_question(question: str) -> str:
     q = question.strip()
 
     SIMPLE_KEYWORDS = [
         "어디서", "어디", "방법", "어떻게", "발급", "신청",
-        "비용", "수수료", "기간", "온라인", "사이트", "뭐"
+        "비용", "수수료", "기간", "온라인", "사이트", "뭐", "점수"
     ]
 
     ANALYSIS_KEYWORDS = [
@@ -131,12 +140,12 @@ def classify_question(question: str) -> str:
     if any(k in q for k in ANALYSIS_KEYWORDS):
         return "analysis"
 
-    return "analysis"  # 기본값
+    return "analysis"
 
 # =========================
 # prompt 빌더 (1)
-# =========================  
-def build_simple_prompt(question: str) -> str:  # 검색창 답변처럼 짧고 정확한 모드
+# =========================
+def build_simple_prompt(question: str) -> str:
     return f"""
 사용자의 질문에 대해 간단하고 정확하게만 답변하라.
 
@@ -151,12 +160,11 @@ def build_simple_prompt(question: str) -> str:  # 검색창 답변처럼 짧고 
 
 [답변]
 """.strip()
-  
 
 # =========================
 # Prompt 빌더 (2) : RAG
 # =========================
-def build_rag_prompt(question: str, context: str) -> str:   # 문서 분석 리포트
+def build_rag_prompt(question: str, context: str) -> str:
     return f"""
 너는 부동산 계약서/등기부/확인서류를 쉽게 설명하는 전문가 AI다.
 
@@ -184,15 +192,12 @@ def build_rag_prompt(question: str, context: str) -> str:   # 문서 분석 리�
 
 # =========================
 # Follow-up Questions (3개)
-# 핵심 아이디어 : 사용자 질문 + AI 답변 + (참고로 쓰인) chunk snippet을 모델에 보여주고
-#                사용자가 다음에 물어볼 만한 질문 3개를 JSON으로만 출력하게 강제
 # =========================
-def _extract_json(text: str) -> str:    # 모델이 JSON 말고 텍스트를 섞으면 {...} 부분만 뽑아서 json.loads 시도
+def _extract_json(text: str) -> str:
     m = re.search(r"\{.*\}", text or "", re.DOTALL)
     return m.group(0) if m else ""
 
 def build_followup_prompt(question: str, answer: str, hits: List[Dict[str, Any]]) -> str:
-    # hits: chroma_search 결과 [{"id","text","meta","score"}, ...]
     lines = []
     for h in (hits or [])[:6]:
         cid = h.get("id")
@@ -231,7 +236,7 @@ def fallback_followups() -> List[str]:
 
 def generate_followups(question: str, answer: str, hits: List[Dict[str, Any]]) -> List[str]:
     prompt = build_followup_prompt(question, answer, hits)
-    raw = chat_answer(prompt)  # 이미 있는 chat_answer 재사용
+    raw = chat_answer(prompt)
 
     try:
         obj = json.loads(_extract_json(raw))
@@ -244,12 +249,10 @@ def generate_followups(question: str, answer: str, hits: List[Dict[str, Any]]) -
 
     return fallback_followups()
 
-
-
 # =========================
 # Chat 호출 : 단순 문자열 vs 상세 메타
 # =========================
-def chat_answer(prompt: str) -> str:    
+def chat_answer(prompt: str) -> str:
     r = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
@@ -259,7 +262,7 @@ def chat_answer(prompt: str) -> str:
         temperature=0.2,
         max_tokens=850,
     )
-    return r.choices[0].message.content.strip() # 그냥 content만 리턴
+    return r.choices[0].message.content.strip()
 
 def chat_answer_detail(prompt: str) -> Dict[str, Any]:
     t0 = time.perf_counter()
@@ -283,10 +286,9 @@ def chat_answer_detail(prompt: str) -> Dict[str, Any]:
     tokens_out = getattr(usage, "completion_tokens", None) if usage else None
     tokens_total = getattr(usage, "total_tokens", None) if usage else None
 
-    # 실제 사용 모델명: 응답에 있으면 그걸 쓰고, 없으면 CHAT_MODEL fallback
     used_model = getattr(r, "model", None) or CHAT_MODEL
 
-    return {    # latency(ms) 측정, tokens_in/out/total, 실제 사용 모델명까지 담아줌
+    return {
         "content": content,
         "model": used_model,
         "tokens_in": int(tokens_in) if tokens_in is not None else None,
@@ -297,7 +299,7 @@ def chat_answer_detail(prompt: str) -> Dict[str, Any]:
         ),
         "latency_ms": latency_ms,
     }
-    
+
 # =========================
 # 세션 제목 자동 생성
 # =========================
@@ -337,7 +339,7 @@ def generate_title_from_messages(raw: str) -> str:
 # =========================
 # Chroma: add & search
 # =========================
-def chroma_add_docs(    # Chroma에 넣기
+def chroma_add_docs(
     docs: List[Dict[str, Any]],
     chunk: bool = True,
     chunk_size: int = 900,
@@ -354,7 +356,6 @@ def chroma_add_docs(    # Chroma에 넣기
         base_id = d.get("id") or "doc"
         text = d.get("text") or ""
 
-        # meta를 복사한 뒤 user_id/doc_id/doc_type/stage를 문자열로 통일
         meta = dict(d.get("meta") or {})
         if "user_id" in meta and meta["user_id"] is not None:
             meta["user_id"] = str(meta["user_id"])
@@ -366,7 +367,7 @@ def chroma_add_docs(    # Chroma에 넣기
             meta["stage"] = str(meta["stage"])
 
         pieces = [text]
-        if chunk:   # chunk 옵션이 켜져 있으면 chunk_text로 분할
+        if chunk:
             pieces = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
 
         for i, p in enumerate(pieces):
@@ -374,14 +375,11 @@ def chroma_add_docs(    # Chroma에 넣기
             if not p:
                 continue
 
-            cid = stable_id(base_id, f"{i}:{p}")    # stable_id로 chunk id 생성
+            cid = stable_id(base_id, f"{i}:{p}")
             ids.append(cid)
-            documents.append(p) # documents에 chunk text 넣기
-
-            # chunk마다 meta dict 복사해서 넣기(안전)
+            documents.append(p)
             metadatas.append(dict(meta))
-
-            embeddings.append(create_embedding(p))  # embeddings에 embedding 넣기
+            embeddings.append(create_embedding(p))
             inserted += 1
 
     if ids:
@@ -392,44 +390,70 @@ def chroma_add_docs(    # Chroma에 넣기
             embeddings=embeddings,
         )
 
-    return inserted # 실제로 추가된 chunk 수(inserted)
+    return inserted
 
-def chroma_search(  # Chroma 검색
-    query_embedding: List[float],   # 질문 임베딩
-    top_k: int = 5,                 # 몇 개 뽑을지
-    # where 필터
-    doc_type: Optional[str] = None, 
+# ✅ CHANGED: Chroma where 빌더 (여러 조건은 반드시 $and + $eq 형태)
+def _build_chroma_where(
+    doc_type: Optional[str] = None,
     stage: Optional[str] = None,
-    user_id: Optional[str] = None,  
-    doc_id: Optional[str] = None,    
+    user_id: Optional[str] = None,
+    doc_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    conds: List[Dict[str, Any]] = []
+
+    def add_eq(field: str, value: Optional[str]):
+        if value is None:
+            return
+        s = str(value).strip()
+        if not s:
+            return
+        conds.append({field: {"$eq": s}})
+
+    add_eq("doc_type", doc_type)
+    add_eq("stage", stage)
+    add_eq("user_id", user_id)
+    add_eq("doc_id", doc_id)
+
+    if not conds:
+        return None
+    if len(conds) == 1:
+        return conds[0]
+    return {"$and": conds}
+
+def chroma_search(
+    query_embedding: List[float],
+    top_k: int = 5,
+    doc_type: Optional[str] = None,
+    stage: Optional[str] = None,
+    user_id: Optional[str] = None,
+    doc_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     return hits: [{"id","text","meta","score"}...]
     score는 (1 - distance) 형태로 근사 (높을수록 유사)
     """
-    where = {}
+    # ✅ CHANGED: where 구조를 Chroma 규칙에 맞게 생성
+    where = _build_chroma_where(
+        doc_type=str(doc_type) if doc_type is not None else None,
+        stage=str(stage) if stage is not None else None,
+        user_id=str(user_id) if user_id is not None else None,
+        doc_id=str(doc_id) if doc_id is not None else None,
+    )
 
-    if doc_type is not None:
-        where["doc_type"] = str(doc_type)
-    if stage is not None:
-        where["stage"] = str(stage)
+    logger.info(f"[CHROMA SEARCH] top_k={top_k} where={where}")
 
-    # B안: 특정 사용자/특정 문서로 제한
-    if user_id is not None:
-        where["user_id"] = str(user_id)
-    if doc_id is not None:
-        where["doc_id"] = str(doc_id)
+    include = ["documents", "metadatas", "distances"]
 
-    if not where:   # 조건이 하나도 없으면 where=None. 컬렉션 전체에서 검색
-        where = None
-
-    include = ["documents", "metadatas", "distances"]   # distance는 작을수록 가까움(유사)
-    res = _chroma_col.query(
+    # ✅ CHANGED: where=None이면 where 파라미터를 아예 빼서 호출(안전)
+    kwargs: Dict[str, Any] = dict(
         query_embeddings=[query_embedding],
-        n_results=top_k,
-        where=where,
+        n_results=int(top_k or 5),
         include=include,
     )
+    if where is not None:
+        kwargs["where"] = where
+
+    res = _chroma_col.query(**kwargs)
 
     ids = (res.get("ids") or [[]])[0]
     docs = (res.get("documents") or [[]])[0]
@@ -447,4 +471,5 @@ def chroma_search(  # Chroma 검색
         })
 
     hits.sort(key=lambda x: x["score"], reverse=True)
+    logger.info(f"[CHROMA SEARCH] hits={len(hits)} top1_meta={(hits[0].get('meta') if hits else None)}")
     return hits

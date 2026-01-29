@@ -5,28 +5,21 @@ from fastapi.middleware.cors import CORSMiddleware
 import time
 import base64
 import binascii
-
+import traceback
 import uvicorn
 from dotenv import load_dotenv
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
-from typing import Optional
 
 from tool import logger
 from document.document import analyze_document, analyze_document_b64
-from chatbot import (
-    make_context_from_hits,
-    build_rag_prompt,
-    create_embedding,
-    chat_answer,
-    chat_answer_detail,
-    generate_title_from_messages,
-    chroma_add_docs,
-    chroma_search,
-    classify_question,
-    build_simple_prompt,
-    generate_followups,
-)
+from chatbot.chatbot import (
+    make_context_from_hits, build_rag_prompt, create_embedding, chat_answer, chat_answer_detail,
+    generate_title_from_messages, chroma_add_docs, chroma_search, classify_question,
+    build_simple_prompt, generate_followups)
+from chatbot.chatbot_schemas import (
+    EmbeddingRequest, EmbeddingResponse, IngestDoc, IngestRequest, AskRequest, AskResponse,
+    RagReference, TitleRequest, TitleResponse, AnalyzeRequest)
 
 # =========================
 # Checklist AI Services
@@ -58,70 +51,6 @@ checklist_rag_service = ChecklistRagService(
 
 checklist_scoring_service = ChecklistScoringService(checklist_rag_service)
 
-
-# =========================
-# Pydantic Models : 요청/응답의 스키마
-# =========================
-class EmbeddingRequest(BaseModel):
-    text: str = Field(..., description="임베딩할 텍스트")
-
-class EmbeddingResponse(BaseModel):
-    embedding: List[float]
-
-class IngestDoc(BaseModel):
-    id: Optional[str] = None
-    text: str
-    meta: Optional[Dict[str, Any]] = None
-
-    # 안 보내면 기본값 사용
-    chunk: Optional[bool] = True
-    chunk_size: Optional[int] = 900
-    overlap: Optional[int] = 120
-
-class IngestRequest(BaseModel):
-    docs: List[IngestDoc]
-
-class AskRequest(BaseModel):
-    question: str
-    context: str | None = None  
-    top_k: int = 5
-
-    # 체크리스트/문서 타입 필터
-    doc_type: Optional[str] = None   # 예: "checklist", "registry", "contract"
-    stage: Optional[str] = None      # 예: "pre", "post"
-    
-    user_id: Optional[str] = None
-    doc_id: Optional[str] = None
-
-class RagReference(BaseModel):
-    chunkId: str
-    title: Optional[str] = None
-    snippet: str
-    
-    score: Optional[float] = None
-    rankNo: Optional[int] = None
-
-class AskResponse(BaseModel):
-    answer: str
-    references: List[RagReference] = []
-    followUpQuestions: List[str] = []
-    
-    model: Optional[str] = None
-    tokensIn: Optional[int] = None
-    tokensOut: Optional[int] = None
-    tokensTotal: Optional[int] = None
-    latencyMs: Optional[int] = None
-
-class TitleRequest(BaseModel):
-    raw: str
-
-class TitleResponse(BaseModel):
-    title: str
-    
-class AnalyzeRequest(BaseModel):
-    image_path: Optional[str] = None
-    image_b64: Optional[str] = None
-    
 # =========================
 # Checklist AI Models
 # =========================
@@ -407,10 +336,48 @@ def hello():
 @app.post("/document/analyze")
 async def analyze_document_endpoint(req: AnalyzeRequest):
     try:
+        # 1) 분석 수행
         if req.image_b64:
-            return analyze_document_b64(req.image_b64)
-        if req.image_path:    
-            return analyze_document(req.image_path)
+            result = analyze_document_b64(req.image_b64)
+        elif req.image_path:
+            result = analyze_document(req.image_path)
+        else:
+            raise HTTPException(status_code=400, detail="image_b64 또는 image_path 필요")
+
+        # 2) doc_id 없으면 만들어서라도 넣기 (없으면 RAG 필터 못 씀)
+        user_id = str(req.user_id) if req.user_id is not None else "anonymous"
+        doc_id = str(req.doc_id) if req.doc_id is not None else f"tmp-{int(time.time())}"
+
+        doc_type = result.get("doc_type", req.doc_type or "UNKNOWN")
+        risk_score = result.get("risk_score")
+        reasons = result.get("reasons") or []
+        ai_explanation = result.get("ai_explanation") or ""
+
+        # 3) Chroma 저장(중요: return 전에!)
+        chroma_add_docs([{
+            "id": f"doc-{user_id}-{doc_id}",
+            "text": f"""문서 유형: {doc_type}
+위험 점수: {risk_score}
+위험 사유:
+{chr(10).join(reasons)}
+
+AI 설명:
+{ai_explanation}
+""",
+            "meta": {
+                "doc_type": str(doc_type),
+                "user_id": str(user_id),
+                "doc_id": str(doc_id),
+                "stage": "analysis",
+            },
+        }])
+
+        # 4) 프론트가 doc_id를 저장할 수 있게 결과에도 내려주기(추천)
+        result["user_id"] = user_id
+        result["doc_id"] = doc_id
+
+        return result
+
     except Exception as e:
         logger.error("문서 분석 실패", exc_info=e)
         raise HTTPException(status_code=500, detail="문서 분석 실패")
@@ -455,86 +422,119 @@ def ingest(req: IngestRequest):
 # 분석질문이면 Chroma 검색 -> 근거 만들기 -> RAG 프롬프트로 LLM 호출 -> 답변+근거+후속질문+사용량 반환 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
-    # 1. 질문 분류
-    q_type = classify_question(req.question)
+    t0 = time.perf_counter()
 
-    # 2-1. simple 질문 처리(RAG X. 빠르고 저렴)
-    if q_type == "simple":
-        prompt = build_simple_prompt(req.question)
-        answer = chat_answer(prompt)
+    # 요청 들어온 값 로그(필터가 제대로 들어오는지 확인)
+    logger.info(
+        f"[ASK IN] qLen={len(req.question or '')} "
+        f"top_k={req.top_k} doc_type={req.doc_type} stage={req.stage} user_id={req.user_id} doc_id={req.doc_id} "
+        f"ctxLen={(len(req.context) if req.context else 0)}"
+    )
+
+    try:
+        # 1) 질문 분류
+        q_type = classify_question(req.question)
+
+        # ✅ doc_id(또는 context)가 있으면 RAG 강제
+        if req.doc_id or (req.context and req.context.strip()):
+            q_type = "rag"
+
+        # 2-1) simple
+        if q_type == "simple":
+            prompt = build_simple_prompt(req.question)
+            detail = chat_answer_detail(prompt)
+
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            logger.info(f"[ASK OUT] type=simple latencyMs={latency_ms} model={detail.get('model')}")
+
+            return AskResponse(
+                answer=detail["content"],
+                references=[],
+                followUpQuestions=[
+                    "이 내용을 3줄로 더 쉽게 설명해줘",
+                    "이걸 하려면 준비물/서류가 뭐가 필요해?",
+                    "내 상황에서 주의할 점 3가지만 알려줘"
+                ],
+                model=detail.get("model"),
+                tokensIn=detail.get("tokens_in"),
+                tokensOut=detail.get("tokens_out"),
+                tokensTotal=detail.get("tokens_total"),
+                latencyMs=detail.get("latency_ms") if detail.get("latency_ms") is not None else latency_ms,
+            )
+
+        # 2-2) rag
+        q_emb = create_embedding(req.question)
+
+        hits = chroma_search(
+            query_embedding=q_emb,
+            top_k=req.top_k,
+            doc_type=req.doc_type,
+            stage=req.stage,
+            user_id=req.user_id,
+            doc_id=req.doc_id,
+        )
+
+        # ⭐ hits 0건이면 이 시점에서 바로 원인 파악 가능
+        logger.info(
+            f"[ASK RAG] hits={len(hits)} "
+            f"filters(doc_type={req.doc_type}, stage={req.stage}, user_id={req.user_id}, doc_id={req.doc_id})"
+        )
+
+        rag_context = make_context_from_hits(hits)
+
+        merged_context = ""
+        if req.context:
+            merged_context += "=== [세션 참고자료] ===\n" + req.context.strip() + "\n\n"
+        merged_context += "=== [RAG 검색자료] ===\n" + (rag_context.strip() if rag_context else "(없음)")
+
+        prompt = build_rag_prompt(req.question, merged_context)
         detail = chat_answer_detail(prompt)
+        answer = detail["content"]
 
-        # simple은 refs 없으니 fallback으로만 3개 제공(또는 generate_followups 호출 안 해도 됨)
+        references = [
+            RagReference(
+                chunkId=h["id"],
+                title=(h.get("meta") or {}).get("title"),
+                snippet=(h.get("text") or "")[:200],
+                score=float(h.get("score", 0.0)),
+                rankNo=i + 1
+            )
+            for i, h in enumerate(hits)
+        ]
+
+        followups = generate_followups(req.question, answer, hits)
+
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info(
+            f"[ASK OUT] type=rag latencyMs={latency_ms} model={detail.get('model')} "
+            f"tokens_in={detail.get('tokens_in')} tokens_out={detail.get('tokens_out')} total={detail.get('tokens_total')}"
+        )
+
         return AskResponse(
-            answer=detail["content"],
-            references=[],
-            followUpQuestions=[
-                "이 내용을 3줄로 더 쉽게 설명해줘",
-                "이걸 하려면 준비물/서류가 뭐가 필요해?",
-                "내 상황에서 주의할 점 3가지만 알려줘"
-            ],
-            model=detail["model"],
-            tokensIn=detail["tokens_in"],
-            tokensOut=detail["tokens_out"],
-            tokensTotal=detail["tokens_total"],
-            latencyMs=detail["latency_ms"],
+            answer=answer,
+            references=references,
+            followUpQuestions=followups,
+            model=detail.get("model"),
+            tokensIn=detail.get("tokens_in"),
+            tokensOut=detail.get("tokens_out"),
+            tokensTotal=detail.get("tokens_total"),
+            latencyMs=detail.get("latency_ms") if detail.get("latency_ms") is not None else latency_ms,
         )
 
+    except HTTPException:
+        # 이미 status_code 있는 예외는 그대로 올림
+        raise
 
-    # 2-2. 분석 질문이면 RAG 수행
-    # 질문 임베딩
-    q_emb = create_embedding(req.question)
+    except Exception as e:
+        # ✅ 여기서 traceback까지 남겨야 원인이 100% 잡힘
+        tb = traceback.format_exc()
+        logger.error(f"[ASK ERROR] {e}\n{tb}")
 
-    # Chroma 검색
-    hits = chroma_search(
-        query_embedding=q_emb,
-        top_k=req.top_k,
-        doc_type=req.doc_type,
-        stage=req.stage,
-        user_id=req.user_id,
-        doc_id=req.doc_id,
-    )
-
-    # RAG 컨텍스트 만들기 : hits의 텍스트/메타를 LLM 프롬프트에 넣기 좋은 형태로 변환
-    rag_context = make_context_from_hits(hits)
-    
-    # 세션 컨텍스트 + RAG 검색 컨텍스트 합치기
-    merged_context = ""
-    if req.context:
-        merged_context += "=== [세션 참고자료] ===\n" + req.context.strip() + "\n\n"
-    merged_context += "=== [RAG 검색자료] ===\n" + (rag_context.strip() if rag_context else "(없음)")
-
-    # LLM 호출 (상세 메타 포함)
-    detail = chat_answer_detail(build_rag_prompt(req.question, merged_context))
-    answer = detail["content"]
-
-    # references 만들기 
-    references = [
-        RagReference(
-            chunkId=h["id"],    # chunkId = chroma id(문자열)
-            title=(h.get("meta") or {}).get("title"),
-            snippet=(h.get("text") or "")[:200],        # 200만 자름(프론트에 길게 안 보내려는 의도)
-            score=float(h.get("score", 0.0)),
-            rankNo=i + 1    # 검색 순위 (1부터)
+        # Spring에서 e.getResponseBodyAsString()으로 detail을 볼 수 있게 detail에 넣어줌
+        raise HTTPException(
+            status_code=500,
+            detail=f"/ask failed: {type(e).__name__}: {str(e)}"
         )
-        for i, h in enumerate(hits)
-    ]
-
-    # followups 생성 (근거 기반)
-    followups = generate_followups(req.question, answer, hits)
-
-    # AskResponse로 반환 (usage 포함)
-    return AskResponse(
-        answer=answer,
-        references=references,
-        followUpQuestions=followups,
-        model=detail["model"],
-        tokensIn=detail["tokens_in"],
-        tokensOut=detail["tokens_out"],
-        tokensTotal=detail["tokens_total"],
-        latencyMs=detail["latency_ms"],
-    )
-
 # 세션 제목 생성
 @app.post("/title", response_model=TitleResponse)
 def make_title(req: TitleRequest):
