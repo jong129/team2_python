@@ -1,6 +1,7 @@
 # checklist/checklist_rag.py
 
 from typing import List, Dict
+from pydantic import BaseModel
 import json
 import os
 
@@ -11,6 +12,24 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.documents import Document
 
 
+# ---------- AI 미리보기 ----------
+class ChecklistAiPreviewRequest(BaseModel):
+    baseItems: List[str]
+    phase: str
+
+class ChecklistAiPreviewResponse(BaseModel):
+    newItems: List[dict]
+
+
+# ---------- AI 개선 요약 ----------
+class ChecklistImproveSummaryRequest(BaseModel):
+    templateId: int
+    previewItems: List[dict]
+    userStats: List[dict]
+    satisfaction: dict
+
+class ChecklistImproveSummaryResponse(BaseModel):
+    summaries: List[dict]
 
 class ChecklistRagService:
     """
@@ -260,3 +279,88 @@ class ChecklistRagService:
 
         response = self.llm.invoke(prompt).content
         return response.strip()
+    
+    # ==================================================
+    # 5️⃣ API 단위: AI 미리보기
+    # ==================================================
+    def preview(self, req: ChecklistAiPreviewRequest) -> Dict:
+        """
+        /checklist/ai/preview 전용
+        """
+        result = self.generate_new_items(
+            base_items=req.baseItems,
+            phase=req.phase
+        )
+
+        return {
+            "newItems": result.get("new_items", [])
+        }
+        
+    # ==================================================
+    # 6️⃣ API 단위: AI 개선 요약
+    # ==================================================
+    def improve_summary(
+        self,
+        req: ChecklistImproveSummaryRequest
+    ) -> ChecklistImproveSummaryResponse:
+        """
+        /checklist/ai/improve/summary 전용
+        - 개선된 체크리스트 항목별 사유 설명 생성
+        """
+
+        # 1️⃣ 가이드라인 추출
+        guideline_result = self.extract_guidelines()
+        guidelines = guideline_result.get("guidelines", [])
+
+        summaries = []
+
+        # 2️⃣ 항목별 사유 생성
+        for item in req.previewItems:
+            title = item.get("title")
+
+            # 🔍 가장 근접한 가이드라인 매칭
+            guideline = next(
+                (g for g in guidelines if g.get("title") and g["title"] in title),
+                {
+                    "title": "전세 계약 사기 예방 일반 기준",
+                    "importance": "MEDIUM",
+                    "description": "전세 계약 과정에서 반복적으로 문제가 발생하는 주요 위험 요소",
+                    "source": "PDF 종합 가이드"
+                }
+            )
+
+            # 📊 사용자 통계 매칭
+            stat = next(
+                (s for s in req.userStats if s.get("itemTitle") == title),
+                {}
+            )
+
+            # 🧠 사유 설명 생성
+            reason = self.explain_item_reason(
+                guideline=guideline,
+                user_stats=stat,
+                satisfaction=req.satisfaction,
+                preview_item=item
+            )
+
+            summaries.append({
+                "title": title,
+                "reason": reason
+            })
+
+        return ChecklistImproveSummaryResponse(summaries=summaries)
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+rag_service = ChecklistRagService(
+    pdf_path=os.path.join(
+        BASE_DIR,
+        "전세 계약. 두렵지 않아요 전세 사기 예방 A to Z.pdf"
+    ),
+    txt_path=os.path.join(
+        BASE_DIR,
+        "체크리스트_항목.txt"
+    )
+)
+

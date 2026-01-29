@@ -27,10 +27,30 @@ from chatbot.chatbot_schemas import (
 # =========================
 # Checklist AI Services
 # =========================
-from checklist.checklist_rag import ChecklistRagService
-from checklist.checklist_scoring import ChecklistScoringService
-from checklist.checklist_summary import ChecklistSummaryService
-from checklist.checklist_review import ChecklistReviewService, PostChecklistReviewRequest
+from checklist.checklist_rag import (
+    rag_service,
+    ChecklistAiPreviewRequest,
+    ChecklistAiPreviewResponse,
+    ChecklistImproveSummaryRequest,
+    ChecklistImproveSummaryResponse,
+)
+from checklist.checklist_scoring import (
+    scoring_service,
+    ChecklistScoreRequest,
+    ChecklistScoreResponse,
+)
+
+from checklist.checklist_review import (
+    review_service,
+    PostChecklistReviewRequest,
+)
+
+from checklist.checklist_summary import (
+    ChecklistSummaryRequest,
+    ChecklistSummaryResponse,
+    summarize as summarize_checklist_service,
+)
+
 
 load_dotenv()
 
@@ -44,141 +64,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# =========================
-# Checklist AI Service Init
-# =========================
-checklist_rag_service = ChecklistRagService(
-    pdf_path="전세 계약. 두렵지 않아요 전세 사기 예방 A to Z.pdf",
-    txt_path="체크리스트_항목.txt"
-)
-
-checklist_scoring_service = ChecklistScoringService(checklist_rag_service)
-
-checklist_review_service = ChecklistReviewService(checklist_scoring_service)
-# =========================
-# Checklist AI Models
-# =========================
-
-# ---------- 만족도 요약 ----------
-class ChecklistSummaryRequest(BaseModel):
-    templateId: int
-    comments: List[str]
-
-class ChecklistSummaryResponse(BaseModel):
-    positive: List[str]
-    negative: List[str]
-    suggestions: List[str]
-
-
-# ---------- AI 미리보기 ----------
-class ChecklistAiPreviewRequest(BaseModel):
-    baseItems: List[str]
-    phase: str
-
-class ChecklistAiPreviewResponse(BaseModel):
-    newItems: List[dict]
-
-
-# ---------- AI 개선 요약 ----------
-class ChecklistImproveSummaryRequest(BaseModel):
-    templateId: int
-    previewItems: List[dict]
-    userStats: List[dict]
-    satisfaction: dict
-
-class ChecklistImproveSummaryResponse(BaseModel):
-    summaries: List[dict]
-
-
-# ---------- AI 중요도 스코어링 ----------
-class ChecklistScoreItem(BaseModel):
-    itemId: int
-    title: str
-    description: str
-
-class ChecklistScoreRequest(BaseModel):
-    items: List[ChecklistScoreItem]
-
-class ChecklistScoreResult(BaseModel):
-    itemId: int
-    title: str
-    importanceScore: float
-    reason: str
-
-class ChecklistScoreResponse(BaseModel):
-    scores: List[ChecklistScoreResult]
-
-import re
-import json
-from openai import OpenAI
-import os
-
-def is_meaningful_comment(comment: str) -> bool:
-    """
-    의미 없는 코멘트 필터링
-    """
-    c = comment.strip()
-
-    if len(c) < 5:
-        return False
-
-    if re.fullmatch(r"(.)\1{3,}", c):
-        return False
-
-    if re.fullmatch(r"[ㄱ-ㅎㅏ-ㅣ]+", c):
-        return False
-
-    meaningless = {"test", "asdf", "qwer", "...", "???", "!!!"}
-    if c.lower() in meaningless:
-        return False
-
-    return True
-
-def call_llm_for_summary(comments: List[str]) -> dict:
-    """
-    만족도 코멘트 요약
-    """
-    
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    
-    prompt = f"""
-다음은 체크리스트 사용자 만족도 코멘트 목록이다.
-
-반드시 JSON으로만 응답하라.
-설명, 마크다운, 코드블록은 절대 포함하지 마라.
-
-형식:
-{{
-  "positive": ["..."],
-  "negative": ["..."],
-  "suggestions": ["..."]
-}}
-
-코멘트:
-{chr(10).join(comments)}
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "너는 체크리스트 UX 분석 전문가다."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.4,
-    )
-
-    try:
-        result = json.loads(response.choices[0].message.content.strip())
-        if not result.get("suggestions"):
-            result["suggestions"] = ["특이 제안 없음."]
-        return result
-    except Exception:
-        return {
-            "positive": [],
-            "negative": [],
-            "suggestions": ["요약 생성 실패"]
-        }
 
 # =========================
 # Routes
@@ -412,131 +297,27 @@ def make_title(req: TitleRequest):
 
 @app.post("/checklist/summary", response_model=ChecklistSummaryResponse)
 def summarize_checklist(req: ChecklistSummaryRequest):
-    """
-    관리자용 체크리스트 만족도 요약
-    """
-    filtered = [c for c in req.comments if is_meaningful_comment(c)]
-
-    if not filtered:
-        return ChecklistSummaryResponse(
-            positive=[],
-            negative=[],
-            suggestions=["의미 있는 사용자 코멘트가 없습니다."]
-        )
-
-    result = call_llm_for_summary(filtered)
-
-    return ChecklistSummaryResponse(
-        positive=result.get("positive", []),
-        negative=result.get("negative", []),
-        suggestions=result.get("suggestions", []),
-    )
+    return summarize_checklist_service(req)
 
 
 @app.post("/checklist/ai/preview", response_model=ChecklistAiPreviewResponse)
 def checklist_ai_preview(req: ChecklistAiPreviewRequest):
-    """
-    PDF 기반 AI 체크리스트 개선 미리보기
-    """
-    result = checklist_rag_service.generate_new_items(
-        base_items=req.baseItems,
-        phase=req.phase
-    )
-
-    return ChecklistAiPreviewResponse(
-        newItems=result.get("new_items", [])
-    )
+    return rag_service.preview(req)
 
 
 @app.post("/checklist/ai/improve/summary", response_model=ChecklistImproveSummaryResponse)
 def checklist_ai_improve_summary(req: ChecklistImproveSummaryRequest):
-    """
-    AI 개선 체크리스트 항목별 이유 설명
-    """
-    guideline_result = checklist_rag_service.extract_guidelines()
-    guidelines = guideline_result.get("guidelines", [])
-
-    summaries = []
-
-    for item in req.previewItems:
-        title = item.get("title")
-
-        guideline = next(
-            (g for g in guidelines if g.get("title") and g["title"] in title),
-            {
-                "title": "전세 계약 사기 예방 일반 기준",
-                "importance": "MEDIUM",
-                "description": "전세 계약 과정에서 반복적으로 문제가 발생하는 주요 위험 요소",
-                "source": "PDF 종합 가이드"
-            }
-        )
-
-        stat = next(
-            (s for s in req.userStats if s.get("itemTitle") == title),
-            {}
-        )
-
-        reason = checklist_rag_service.explain_item_reason(
-            guideline=guideline,
-            user_stats=stat,
-            satisfaction=req.satisfaction,
-            preview_item=item
-        )
-
-        summaries.append({
-            "title": title,
-            "reason": reason
-        })
-
-    return ChecklistImproveSummaryResponse(summaries=summaries)
+    return rag_service.improve_summary(req)
 
 
 @app.post("/checklist/ai/score", response_model=ChecklistScoreResponse)
 def checklist_score(req: ChecklistScoreRequest):
-    """
-    체크리스트 항목 중요도 스코어링
-    """
-    items = [
-        {
-            "itemId": i.itemId,
-            "title": i.title,
-            "description": i.description
-        }
-        for i in req.items
-    ]
+    return scoring_service.score(req)
 
-    result = checklist_scoring_service.score_items(items)
-
-    return ChecklistScoreResponse(
-        scores=result.get("scores", [])
-    )
 
 @app.post("/checklist/post/review")
 def review_post_checklist(req: PostChecklistReviewRequest):
-    """
-    POST 체크리스트 진행 상태 리뷰
-    - NOT_DONE 항목만 기준
-    - 중요도 스코어링 + 후속 조치 안내 생성
-    """
-
-    # 1️⃣ NOT_DONE 항목 변환 (ChecklistScoringService 입력 형식)
-    not_done_items = [
-        {
-            "itemId": item.itemId,
-            "title": item.title,
-            "description": item.description
-        }
-        for item in req.notDoneItems
-    ]
-
-    # 2️⃣ 리뷰 생성
-    result = checklist_review_service.review_post_status(
-        not_done_items=not_done_items,
-        total=req.total,
-        done=req.done
-    )
-
-    return result
+    return review_service.review(req)
 
 
 # =========================

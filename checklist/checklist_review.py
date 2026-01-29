@@ -5,6 +5,7 @@ import os
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
+from checklist.checklist_scoring import scoring_service
 
 
 class PostChecklistReviewItem(BaseModel):
@@ -140,3 +141,34 @@ class ChecklistReviewService:
             return "관련 자료를 확인하고 필요한 후속 조치를 진행해 주세요."
 
         return response
+    
+    # ==================================================
+    # 2️⃣ API 단위: POST 체크리스트 리뷰
+    # ==================================================
+    def review(
+        self,
+        req: PostChecklistReviewRequest
+    ) -> Dict:
+        """
+        /checklist/post/review 전용 엔트리포인트
+        """
+
+        # 1️⃣ NOT_DONE 항목 변환 (scoring_service 입력 형식)
+        not_done_items = [
+            {
+                "itemId": item.itemId,
+                "title": item.title,
+                "description": item.description,
+            }
+            for item in req.notDoneItems
+        ]
+
+        # 2️⃣ 리뷰 생성
+        return self.review_post_status(
+            not_done_items=not_done_items,
+            total=req.total,
+            done=req.done
+        )
+
+
+review_service = ChecklistReviewService(scoring_service)

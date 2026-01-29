@@ -1,8 +1,28 @@
 # checklist/checklist_scoring.py
 
-from typing import Dict
+from typing import Dict, List
+from pydantic import BaseModel
 import json
 
+from checklist.checklist_rag import rag_service
+
+
+class ChecklistScoreItem(BaseModel):
+    itemId: int
+    title: str
+    description: str
+
+class ChecklistScoreRequest(BaseModel):
+    items: List[ChecklistScoreItem]
+
+class ChecklistScoreResult(BaseModel):
+    itemId: int
+    title: str
+    importanceScore: float
+    reason: str
+
+class ChecklistScoreResponse(BaseModel):
+    scores: List[ChecklistScoreResult]
 
 class ChecklistScoringService:
     """
@@ -111,3 +131,29 @@ class ChecklistScoringService:
         return {
             "scores": results
         }
+        
+    # ==================================================
+    # 3️⃣ API 단위: 중요도 스코어링
+    # ==================================================
+    def score(self, req: ChecklistScoreRequest) -> ChecklistScoreResponse:
+        """
+        /checklist/ai/score 전용 엔트리포인트
+        """
+
+        items = [
+            {
+                "itemId": i.itemId,
+                "title": i.title,
+                "description": i.description,
+            }
+            for i in req.items
+        ]
+
+        result = self.score_items(items)
+
+        return ChecklistScoreResponse(
+            scores=result.get("scores", [])
+        )
+
+
+scoring_service = ChecklistScoringService(rag_service)

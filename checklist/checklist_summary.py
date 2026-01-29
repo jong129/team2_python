@@ -1,8 +1,88 @@
 # checklist/checklist_summary.py
 from typing import List, Dict
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
 import os
 import json
+import re
+from openai import OpenAI
+
+
+class ChecklistSummaryRequest(BaseModel):
+    templateId: int
+    comments: List[str]
+
+class ChecklistSummaryResponse(BaseModel):
+    positive: List[str]
+    negative: List[str]
+    suggestions: List[str]
+    
+def is_meaningful_comment(comment: str) -> bool:
+    """
+    의미 없는 코멘트 필터링
+    """
+    c = comment.strip()
+
+    if len(c) < 5:
+        return False
+
+    if re.fullmatch(r"(.)\1{3,}", c):
+        return False
+
+    if re.fullmatch(r"[ㄱ-ㅎㅏ-ㅣ]+", c):
+        return False
+
+    meaningless = {"test", "asdf", "qwer", "...", "???", "!!!"}
+    if c.lower() in meaningless:
+        return False
+
+    return True
+
+def call_llm_for_summary(comments: List[str]) -> dict:
+    """
+    만족도 코멘트 요약
+    """
+    
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    
+    prompt = f"""
+다음은 체크리스트 사용자 만족도 코멘트 목록이다.
+
+반드시 JSON으로만 응답하라.
+설명, 마크다운, 코드블록은 절대 포함하지 마라.
+
+형식:
+{{
+  "positive": ["..."],
+  "negative": ["..."],
+  "suggestions": ["..."]
+}}
+
+코멘트:
+{chr(10).join(comments)}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "너는 체크리스트 UX 분석 전문가다."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.4,
+    )
+
+    try:
+        result = json.loads(response.choices[0].message.content.strip())
+        if not result.get("suggestions"):
+            result["suggestions"] = ["특이 제안 없음."]
+        return result
+    except Exception:
+        return {
+            "positive": [],
+            "negative": [],
+            "suggestions": ["요약 생성 실패"]
+        }
+    
 
 
 class ChecklistSummaryService:
@@ -73,3 +153,30 @@ class ChecklistSummaryService:
                     "필요하다면 전문가의 도움을 받아 검토해 보세요."
                 ]
             }
+
+# ==================================================
+# API 전용 서비스 인스턴스
+# ==================================================
+summary_service = ChecklistSummaryService()
+
+
+def summarize(req: ChecklistSummaryRequest) -> ChecklistSummaryResponse:
+    """
+    /checklist/summary 전용 엔트리포인트
+    """
+    filtered = [c for c in req.comments if is_meaningful_comment(c)]
+
+    if not filtered:
+        return ChecklistSummaryResponse(
+            positive=[],
+            negative=[],
+            suggestions=["의미 있는 사용자 코멘트가 없습니다."]
+        )
+
+    result = call_llm_for_summary(filtered)
+
+    return ChecklistSummaryResponse(
+        positive=result.get("positive", []),
+        negative=result.get("negative", []),
+        suggestions=result.get("suggestions", []),
+    )
