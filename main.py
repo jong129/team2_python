@@ -26,7 +26,8 @@ from chatbot.chatbot_schemas import (
 # =========================
 from checklist.checklist_rag import ChecklistRagService
 from checklist.checklist_scoring import ChecklistScoringService
-
+from checklist.checklist_summary import ChecklistSummaryService
+from checklist.checklist_review import ChecklistReviewService, PostChecklistReviewRequest
 
 load_dotenv()
 
@@ -50,7 +51,6 @@ checklist_rag_service = ChecklistRagService(
 )
 
 checklist_scoring_service = ChecklistScoringService(checklist_rag_service)
-
 # =========================
 # Checklist AI Models
 # =========================
@@ -97,6 +97,7 @@ class ChecklistScoreRequest(BaseModel):
 
 class ChecklistScoreResult(BaseModel):
     itemId: int
+    title: str
     importanceScore: float
     reason: str
 
