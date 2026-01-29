@@ -47,15 +47,16 @@ class ChecklistReviewService:
         POST 체크리스트 현재 상태 리뷰 생성
         """
 
+        # not_done 항목이 없는 경우
         not_done = len(not_done_items)
 
         if not not_done_items:
           return {
               "totalCount": total,
               "doneCount": done,
-              "notDoneCount": not_done,
-              "summary": message,
-              "items": review_items
+              "notDoneCount": 0,
+              "summary": "모든 항목이 확인되었습니다.",
+              "items": []
           }
 
         # 1️⃣ 중요도 스코어링 (PDF 근거)
@@ -88,10 +89,10 @@ class ChecklistReviewService:
             })
 
         return {
-            "total": total,
-            "done": done,
-            "notDone": not_done,
-            "message": message,
+            "totalCount": total,
+            "doneCount": done,
+            "notDoneCount": not_done,
+            "summary": message,
             "items": review_items
         }
 

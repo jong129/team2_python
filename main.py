@@ -54,6 +54,8 @@ checklist_rag_service = ChecklistRagService(
 )
 
 checklist_scoring_service = ChecklistScoringService(checklist_rag_service)
+
+checklist_review_service = ChecklistReviewService(checklist_scoring_service)
 # =========================
 # Checklist AI Models
 # =========================
@@ -508,6 +510,34 @@ def checklist_score(req: ChecklistScoreRequest):
     return ChecklistScoreResponse(
         scores=result.get("scores", [])
     )
+
+@app.post("/checklist/post/review")
+def review_post_checklist(req: PostChecklistReviewRequest):
+    """
+    POST 체크리스트 진행 상태 리뷰
+    - NOT_DONE 항목만 기준
+    - 중요도 스코어링 + 후속 조치 안내 생성
+    """
+
+    # 1️⃣ NOT_DONE 항목 변환 (ChecklistScoringService 입력 형식)
+    not_done_items = [
+        {
+            "itemId": item.itemId,
+            "title": item.title,
+            "description": item.description
+        }
+        for item in req.notDoneItems
+    ]
+
+    # 2️⃣ 리뷰 생성
+    result = checklist_review_service.review_post_status(
+        not_done_items=not_done_items,
+        total=req.total,
+        done=req.done
+    )
+
+    return result
+
 
 # =========================
 # Board AI Routes (from boardaimain.py)
