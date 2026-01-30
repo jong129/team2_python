@@ -17,6 +17,20 @@ class ChecklistSummaryResponse(BaseModel):
     negative: List[str]
     suggestions: List[str]
     
+# =========================
+# PRE 위험 설명 (사전 체크리스트)
+# =========================
+
+class PreRiskExplanationRequest(BaseModel):
+    riskScoreSum: float
+    reasons: List[str]
+
+
+class PreRiskExplanationResponse(BaseModel):
+    summary: str
+    actions: List[str]
+
+    
 def is_meaningful_comment(comment: str) -> bool:
     """
     의미 없는 코멘트 필터링
@@ -179,4 +193,21 @@ def summarize(req: ChecklistSummaryRequest) -> ChecklistSummaryResponse:
         positive=result.get("positive", []),
         negative=result.get("negative", []),
         suggestions=result.get("suggestions", []),
+    )
+
+def explain_pre_risk(req: PreRiskExplanationRequest) -> PreRiskExplanationResponse:
+    """
+    /checklist/pre/risk/explanation 전용 엔트리포인트
+    - PRE 체크리스트 위험 요약
+    - 이미 scoring에서 선별된 reason만 사용
+    """
+
+    result = summary_service.summarize_pre_result(
+        top_reasons=req.reasons,
+        max_lines=3
+    )
+
+    return PreRiskExplanationResponse(
+        summary=result["summary"],
+        actions=result["actions"]
     )

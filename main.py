@@ -49,6 +49,11 @@ from checklist.checklist_summary import (
     ChecklistSummaryRequest,
     ChecklistSummaryResponse,
     summarize as summarize_checklist_service,
+
+    # ✅ PRE 위험 설명 추가
+    PreRiskExplanationRequest,
+    PreRiskExplanationResponse,
+    explain_pre_risk,
 )
 
 
@@ -318,6 +323,10 @@ def checklist_score(req: ChecklistScoreRequest):
 @app.post("/checklist/post/review")
 def review_post_checklist(req: PostChecklistReviewRequest):
     return review_service.review(req)
+
+@app.post("/checklist/pre/risk/explanation", response_model=PreRiskExplanationResponse)
+def pre_risk_explanation(req: PreRiskExplanationRequest):
+    return explain_pre_risk(req)
 
 
 # =========================
