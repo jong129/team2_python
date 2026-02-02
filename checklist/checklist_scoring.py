@@ -58,6 +58,15 @@ class ChecklistScoringService:
         # 🔍 PDF 기반 문맥 검색
         context = self.rag._retrieve_context(query)
 
+
+        if not context.strip():
+            return {
+                "itemId": item.get("itemId"),
+                "title": item.get("title"),
+                "importanceScore": 0.3,
+                "reason": "공공 가이드 문서에서 해당 항목과 직접적으로 연관된 내용을 찾기 어려움"
+            }
+        
         prompt = f"""
 너는 전세 사기 예방을 위한
 공공 가이드 문서를 분석하는 전문가다.

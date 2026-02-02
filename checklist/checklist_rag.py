@@ -4,10 +4,11 @@ from typing import List, Dict
 from pydantic import BaseModel
 import json
 import os
+import chromadb
+import hashlib
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.documents import Document
 
@@ -54,37 +55,51 @@ class ChecklistRagService:
         PDF + TXT → Chunk → VectorStore → Retriever → LLM
         """
 
-        # 📘 PDF 로딩
+        # 1️⃣ PDF 로딩
         loader = PyPDFLoader(self.pdf_path)
         pdf_docs = loader.load()
 
-        # 📄 TXT 로딩
+        # 2️⃣ TXT 로딩
         txt_docs = self._load_txt(self.txt_path)
-
-        # 📚 문서 병합 (PDF + TXT 동급)
         all_docs = pdf_docs + txt_docs
 
-        # ✂️ 문서 분할
+        # 3️⃣ Chunk
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=800,
             chunk_overlap=150
         )
         chunks = splitter.split_documents(all_docs)
 
-        # 🔢 임베딩
-        embeddings = OpenAIEmbeddings(
+        # 4️⃣ Embedding
+        self.embeddings = OpenAIEmbeddings(
             openai_api_key=os.getenv("OPENAI_API_KEY")
         )
 
-        # 🧠 벡터 스토어
-        self.vectorstore = FAISS.from_documents(chunks, embeddings)
-
-        # 🔍 Retriever
-        self.retriever = self.vectorstore.as_retriever(
-            search_kwargs={"k": 4}
+        # 5️⃣ Chroma Persistent Client
+        self.chroma = chromadb.Client(
+            chromadb.config.Settings(
+                persist_directory="./chroma_rag",
+                anonymized_telemetry=False
+            )
+        )
+        
+        self.collection = self.chroma.get_or_create_collection(
+            name="checklist_rag",
+            embedding_function=self.embeddings
         )
 
-        # 🤖 LLM
+        # 6️⃣ 문서 적재 (최초 1회 기준, 간단 버전)
+        if self.collection.count() == 0:
+            self.collection.add(
+                documents=[d.page_content for d in chunks],
+                metadatas=[d.metadata for d in chunks],
+                ids=[
+                    "rag_" + hashlib.sha1(d.page_content.encode("utf-8")).hexdigest()
+                    for d in chunks
+                ]
+            )
+
+        # 7️⃣ LLM
         self.llm = ChatOpenAI(
             model="gpt-4o-mini",
             temperature=0.3,
@@ -112,8 +127,13 @@ class ChecklistRagService:
         """
         검색 쿼리에 맞는 PDF 문맥을 가져온다
         """
-        docs = self.retriever.invoke(query)
-        return "\n\n".join([d.page_content for d in docs])
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=4
+        )
+
+        documents = results.get("documents", [[]])[0]
+        return "\n\n".join(documents)
 
     # ==================================================
     # 3️⃣ 기존 기능: 신규 체크리스트 항목 생성

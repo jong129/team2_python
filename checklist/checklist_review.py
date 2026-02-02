@@ -64,6 +64,15 @@ class ChecklistReviewService:
         score_result = self.scoring.score_items(not_done_items)
         scores = score_result.get("scores", [])
 
+        if not scores:
+            return {
+                "totalCount": total,
+                "doneCount": done,
+                "notDoneCount": not_done,
+                "summary": "일부 항목이 확인되지 않았으나, 중요도 분석에 필요한 정보가 부족합니다.",
+                "items": []
+            }
+
         # 중요도 내림차순 정렬
         scores = sorted(
             scores,
@@ -72,6 +81,11 @@ class ChecklistReviewService:
         )
 
         # 2️⃣ 상위 항목만 사용자 리뷰 대상으로 (최대 5개)
+        scores = [
+            s for s in scores
+            if s.get("importanceScore", 0) >= 0.3
+        ]
+
         top_items = scores[:5]
 
         # 3️⃣ 사용자 메시지 생성
