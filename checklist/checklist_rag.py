@@ -84,8 +84,7 @@ class ChecklistRagService:
         )
         
         self.collection = self.chroma.get_or_create_collection(
-            name="checklist_rag",
-            embedding_function=self.embeddings
+            name="checklist_rag"
         )
 
         # 6️⃣ 문서 적재 (최초 1회 기준, 간단 버전)
