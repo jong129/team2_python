@@ -33,24 +33,85 @@ class PreRiskExplanationResponse(BaseModel):
     
 def is_meaningful_comment(comment: str) -> bool:
     """
-    의미 없는 코멘트 필터링
+    의미 없는 / 테스트용 / 운영 메타 코멘트 필터링
     """
     c = comment.strip()
 
+    # 1️⃣ 길이 기반
     if len(c) < 5:
         return False
 
+    # 2️⃣ 반복 문자
     if re.fullmatch(r"(.)\1{3,}", c):
         return False
 
+    # 3️⃣ 자모만 있는 경우
     if re.fullmatch(r"[ㄱ-ㅎㅏ-ㅣ]+", c):
         return False
 
-    meaningless = {"test", "asdf", "qwer", "...", "???", "!!!"}
-    if c.lower() in meaningless:
+    # 4️⃣ 완전 무의미 단어
+    meaningless_exact = {
+        "test", "asdf", "qwer", "...", "???", "!!!"
+    }
+    if c.lower() in meaningless_exact:
+        return False
+
+    # 5️⃣ 🔥 개발/운영/테스트 메타 코멘트 차단
+    meaningless_keywords = [
+        "테스트", "test", "테스트중", "확인",
+        "개발", "개발중", "디버그",
+        "ai", "분기", "로직", "api",
+        "요약", "완성", "확인용",
+        "집에서", "회사에서"
+    ]
+
+    lowered = c.lower()
+    if any(k in lowered for k in meaningless_keywords):
         return False
 
     return True
+
+def is_summary_worthy_comment(comment: str) -> bool:
+    """
+    이 코멘트가 '사용자 경험/개선 요약'에
+    실질적으로 가치가 있는지 LLM으로 판별
+    """
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    prompt = f"""
+다음 사용자 코멘트가
+체크리스트 사용 경험, 만족/불만, 개선점 파악에
+의미 있는 정보인지 판단하라.
+
+다음 유형은 false:
+- 테스트/개발/확인 목적
+- 의미 없는 감상
+- 구체적 경험이 없는 짧은 평가
+
+반드시 true 또는 false 중 하나만 출력하라.
+
+코멘트:
+{comment}
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "너는 제품 UX 분석 전문가다."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+        )
+
+        result = response.choices[0].message.content.strip().lower()
+        return result == "true"
+
+    except Exception:
+        # 🔒 실패 시 보수적으로 제외
+        return False
+
 
 def call_llm_for_summary(comments: List[str]) -> dict:
     """
@@ -178,22 +239,34 @@ def summarize(req: ChecklistSummaryRequest) -> ChecklistSummaryResponse:
     """
     /checklist/summary 전용 엔트리포인트
     """
-    filtered = [c for c in req.comments if is_meaningful_comment(c)]
 
-    if not filtered:
+    # 1️⃣ 규칙 기반 필터
+    rule_filtered = [
+        c for c in req.comments
+        if is_meaningful_comment(c)
+    ]
+
+    # 2️⃣ LLM 기반 요약 가치 판별
+    llm_filtered = [
+        c for c in rule_filtered
+        if is_summary_worthy_comment(c)
+    ]
+
+    if not llm_filtered:
         return ChecklistSummaryResponse(
             positive=[],
             negative=[],
-            suggestions=["의미 있는 사용자 코멘트가 없습니다."]
+            suggestions=["요약할 만한 사용자 경험 코멘트가 충분하지 않습니다."]
         )
 
-    result = call_llm_for_summary(filtered)
+    result = call_llm_for_summary(llm_filtered)
 
     return ChecklistSummaryResponse(
         positive=result.get("positive", []),
         negative=result.get("negative", []),
         suggestions=result.get("suggestions", []),
     )
+
 
 def explain_pre_risk(req: PreRiskExplanationRequest) -> PreRiskExplanationResponse:
     """

@@ -19,6 +19,19 @@ class PostChecklistReviewRequest(BaseModel):
     done: int
     notDoneItems: List[PostChecklistReviewItem]
 
+class PostChecklistSummaryItem(BaseModel):
+    itemId: int
+    title: str
+    description: str
+    status: str  # DONE / NOT_REQUIRED
+
+
+class PostChecklistSummaryRequest(BaseModel):
+    total: int
+    done: int
+    completedItems: List[PostChecklistSummaryItem]
+
+
 
 class ChecklistReviewService:
     """
@@ -111,6 +124,73 @@ class ChecklistReviewService:
             "items": review_items
         }
 
+    def summarize_post_completed(
+        self,
+        completed_items: List[Dict],
+        total: int,
+        done: int
+    ) -> Dict:
+        """
+        POST 체크리스트 완료 후 요약 생성
+        - DONE / NOT_REQUIRED 기준
+        - 경고 ❌
+        - 유지·관리 가이드 ⭕
+        """
+
+        if not completed_items:
+            return {
+                "totalCount": total,
+                "doneCount": done,
+                "summary": "체크리스트가 완료되었으며, 추가로 안내할 사항은 없습니다.",
+                "guides": []
+            }
+
+        prompt = f"""
+너는 전세 계약 이후 사용자를 돕는 안내 AI다.
+
+다음은 사용자가 사후 체크리스트를 모두 완료한 결과다.
+이 정보를 바탕으로,
+앞으로 보증금과 권리를 안전하게 유지하기 위한
+'실천 중심의 가이드 요약'을 작성하라.
+
+규칙:
+- 경고, 공포, 위협 표현 금지
+- 이미 완료한 행동을 존중하는 어조
+- 법적 판단, 계약 결론 제시 금지
+- 최대 3문장
+- 안내형 문장 사용
+- JSON 외 텍스트 출력 금지
+
+완료된 항목:
+{json.dumps(completed_items, ensure_ascii=False)}
+
+출력 형식:
+{{
+  "summary": "전체 요약 문장",
+  "guides": [
+    "이후에 유의할 사항 1",
+    "이후에 유의할 사항 2"
+  ]
+}}
+"""
+
+        response = self.llm.invoke(prompt).content.strip()
+
+        try:
+            return json.loads(response)
+        except Exception:
+            # 🔒 fallback
+            return {
+                "totalCount": total,
+                "doneCount": done,
+                "summary": "사후 점검이 정상적으로 완료되었습니다.",
+                "guides": [
+                    "계약 관련 서류를 안전하게 보관해 주세요.",
+                    "추후 변동 사항 발생 시 다시 한 번 확인해 주세요."
+                ]
+            }
+
+
     # ==================================================
     # 내부 헬퍼
     # ==================================================
@@ -183,6 +263,31 @@ class ChecklistReviewService:
             total=req.total,
             done=req.done
         )
+    
+    def summarize_completed(
+        self,
+        req: PostChecklistSummaryRequest
+    ) -> Dict:
+        """
+        /checklist/post/summary 전용 엔트리포인트
+        """
+
+        completed_items = [
+            {
+                "itemId": item.itemId,
+                "title": item.title,
+                "description": item.description,
+                "status": item.status
+            }
+            for item in req.completedItems
+        ]
+
+        return self.summarize_post_completed(
+            completed_items=completed_items,
+            total=req.total,
+            done=req.done
+        )
+
 
 
 review_service = ChecklistReviewService(scoring_service)

@@ -43,6 +43,7 @@ from checklist.checklist_scoring import (
 from checklist.checklist_review import (
     review_service,
     PostChecklistReviewRequest,
+    PostChecklistSummaryRequest,
 )
 
 from checklist.checklist_summary import (
@@ -323,6 +324,11 @@ def checklist_score(req: ChecklistScoreRequest):
 @app.post("/checklist/post/review")
 def review_post_checklist(req: PostChecklistReviewRequest):
     return review_service.review(req)
+
+@app.post("/checklist/post/summary")
+def summarize_post_checklist(req: PostChecklistSummaryRequest):
+    return review_service.summarize_completed(req)
+
 
 @app.post("/checklist/pre/risk/explanation", response_model=PreRiskExplanationResponse)
 def pre_risk_explanation(req: PreRiskExplanationRequest):
