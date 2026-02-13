@@ -9,12 +9,18 @@ from enum import Enum  # ✅ sqlalchemy Enum 말고 파이썬 Enum
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage
+from pydantic import BaseModel
 
 from document.constract.contract import analyze_contract
 from document.registry.registry import analyze_registry
 from tool import logger
 
 client = OpenAI()
+
+class AnalyzeRequest(BaseModel):
+    SpringBoot_FastAPI_KEY: str 
+    userId: int
+    image_paths: Optional[List[str]] = None
 
 
 # ====== DocType ======
@@ -230,44 +236,128 @@ def generate_ai_explanation(score: int, reasons: List[str], policy_version: str)
     resp = llm.invoke([SystemMessage(content=prompt)])
     return resp.content
 
+def generate_overall_score_explanation(
+    total_score: int,
+    results: List[Dict[str, Any]],
+    model: str = "gpt-4o-mini",
+    temperature: float = 0.0,
+) -> str:
+    """
+    이미 계산된 total_score가 왜 나왔는지 설명하는 종합 설명 생성기
+    - results의 ai_explanation / reasons만 종합
+    - 새로운 판단 / 점수 계산 금지
+    - 반환값: string 1개
+    """
 
+    llm = ChatOpenAI(model=model, temperature=temperature)
+
+    # 문서별 설명을 LLM이 보기 좋게 정리
+    doc_blocks = []
+    for r in results:
+        doc_blocks.append(
+            f"""[문서 {r.get('index')} | {r.get('doc_type')} | 점수 {r.get('risk_score')}]
+{r.get('ai_explanation') or "- 설명 없음"}"""
+        )
+
+    prompt = f"""
+너는 '전세계약 위험 점수'에 대한 설명을 정리하는 AI다.
+
+아래 규칙을 반드시 지켜라:
+- 새로운 판단이나 위험 분석을 절대 하지 마라.
+- 점수 계산을 절대 하지 마라.
+- 이미 주어진 문서별 설명을 '정리·요약·연결'만 해라.
+- 입력에 없는 사실을 추가하지 마라.
+- 출력은 한 덩어리의 자연스러운 한국어 설명 문자열만 반환해라.
+- 목록, 번호, 마크다운을 사용하지 마라.
+
+[최종 위험 점수]
+{total_score}점
+
+[문서별 설명]
+{chr(10).join(doc_blocks)}
+
+이 점수가 나온 이유를 사용자가 이해할 수 있도록 한 문단으로 설명해라.
+""".strip()
+
+    resp = llm.invoke([SystemMessage(content=prompt)])
+    return resp.content.strip()
+
+def calculate_risk_score(scores: List[int]) -> int:
+    """
+    여러 문서 risk_score 기반 최종 위험 점수 계산
+
+    규칙:
+    1) 전부 0이면 → 0점
+    2) 하나라도 위험 있으면:
+       - 기본 50점
+       - max와 avg를 혼합해서 추가점수 부여 (최대 50점)
+       - 최종 점수는 최대 100점
+    """
+
+    # ✅ 문서가 없거나 전부 0이면 위험 없음
+    if not scores or all(score == 0 for score in scores):
+        return 0
+
+    base_score = 50
+    max_score = max(scores)
+    avg_score = sum(scores) / len(scores)
+
+    # ✅ max + avg 혼합 (0~100)
+    mixed_score = (max_score * 0.7) + (avg_score * 0.3)
+
+    # ✅ mixed_score(0~100) → scaled_add(0~50)
+    scaled_add = int(mixed_score * 0.5)
+
+    total_score = min(100, base_score + scaled_add)
+
+    return total_score
 # -------------------------------------------------
 # 최종 진입 함수
 # -------------------------------------------------
-def analyze_document(image_path: str) -> Dict[str, Any]:
+def analyze_document(image_paths: List[str]) -> Dict[str, Any]:
+    results: List[Dict[str, Any]] = []
+    scores: List[float] = []
+    count=0
     try:
-        images_b64 = load_images_b64(image_path)
-        img_b64 = images_b64[0]
+        for image_path in image_paths:
+            count+=1
+            images_b64 = load_images_b64(image_path)
+            img_b64 = images_b64[0]
 
-        cls = classify_document_with_override(img_b64)
-        doc_type = cls.doc_type
+            cls = classify_document_with_override(img_b64)
+            doc_type = cls.doc_type
 
-        logger.info("문서 타입=%s conf=%s evidence=%s override=%s",
+            logger.info("문서 타입=%s conf=%s evidence=%s override=%s",
                     doc_type, cls.confidence, cls.evidence, cls.override_reason)
 
-        if doc_type == DocType.UNKNOWN:
-            raise ValueError("문서 타입을 분류할 수 없습니다.")
-
+            if doc_type == DocType.UNKNOWN:
+                raise ValueError("문서 타입을 분류할 수 없습니다.")
         # 일단 지금은 전부 analyze_registry로 보내고 있는데,
         # 추후 doc_type별로 analyze_registry/analyze_contract/analyze_building으로 분기하면 됨.
-        if doc_type == DocType.CONTRACT:
-            score, reasons, policy_version, parsed_data = analyze_contract(images_b64)
-        elif doc_type == DocType.REGISTRY:
-            score, reasons, policy_version, parsed_data = analyze_registry(images_b64)
-        explanation = generate_ai_explanation(score, reasons, policy_version)
-
+            if doc_type == DocType.CONTRACT:
+                score, reasons, policy_version = analyze_contract(images_b64)
+            elif doc_type == DocType.REGISTRY:
+                score, reasons, policy_version = analyze_registry(images_b64)
+            explanation = generate_ai_explanation(score, reasons, policy_version)
+            scores.append(score)
+            results.append({
+                "index":count,
+                "image_path": image_path,
+                "doc_type": doc_type.value,
+                "policy_version": policy_version,
+                "risk_score": score,
+                "reasons": reasons,
+                "ai_explanation": explanation,
+            })
+        risk_score = calculate_risk_score(scores)
+        total_explanations=generate_overall_score_explanation(risk_score,results)
+        logger.info(total_explanations)
         return {
-            "doc_type": doc_type.value,  # ✅ Enum이면 .value로 문자열 내려주는 게 안전
-            "policy_version": policy_version,
-            "risk_score": score,
-            "reasons": reasons,
-            "ai_explanation": explanation,
-            # 디버깅/추적용(원하면 빼도 됨)
-            "doc_confidence": cls.confidence,
-            "doc_evidence": cls.evidence,
-            "override_reason": cls.override_reason,
-            "parsed_data": parsed_data,
-        }
+        "count": count,
+        "results": results,
+        "ai_explanation":total_explanations,
+        "risk_score": risk_score,
+    }
 
     except Exception:
         logger.error("문서 분석 실패", exc_info=True, extra={"image_path": image_path})
@@ -287,7 +377,7 @@ def analyze_document_b64(img_b64: str) -> Dict[str, Any]:
     if doc_type == DocType.UNKNOWN:
         raise ValueError("문서 타입을 분류할 수 없습니다.")
 
-    score, reasons, policy_version, parsed_data = analyze_registry(images_b64)
+    score, reasons, policy_version = analyze_registry(images_b64)
     explanation = generate_ai_explanation(score, reasons, policy_version)
 
     return {
@@ -299,5 +389,4 @@ def analyze_document_b64(img_b64: str) -> Dict[str, Any]:
         "doc_confidence": cls.confidence,
         "doc_evidence": cls.evidence,
         "override_reason": cls.override_reason,
-        "parsed_data": parsed_data,
     }

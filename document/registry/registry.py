@@ -17,7 +17,15 @@ def build_vision_content(user_text: str, images_b64: List[str]) -> List[dict]:
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
         )
     return content
-
+# -------------------------------------------------
+# 위험도 점수 스케일링
+# -------------------------------------------------
+def scale_to_100(raw_score: int, rules) -> int:
+    max_possible = sum(int(r.score) for r in rules)  # rules 전체 점수 합
+    if max_possible <= 0:
+        return 0
+    scaled = int(round((raw_score / max_possible) * 100))
+    return max(0, min(100, scaled))
 
 # -------------------------------------------------
 # 위험 점수 계산 (DB 룰 기반)
@@ -54,8 +62,8 @@ def calculate_registry_risk_score(parsed_data: dict, rules) -> Tuple[int, List[s
             if parsed_data.get("근저당", {}).get("exists"):
                 total_score += rule.score
                 reasons.append(rule.description)
-
-    return total_score, reasons
+    scaled = scale_to_100(total_score, rules)
+    return scaled, reasons
 
 
 # -------------------------------------------------
@@ -125,12 +133,10 @@ def analyze_registry(images_b64: List[str]) -> Tuple[int, List[str], str, Dict[s
         policy = get_active_policy(db)
         if not policy:
             raise ValueError("활성 정책이 없습니다.")
-
+        
         rules = get_active_rules(db, policy.id)
-
         parsed_data = parse_registry_info(images_b64)
         score, reasons = calculate_registry_risk_score(parsed_data, rules)
-
-        return score, reasons, policy.version, parsed_data
+        return score, reasons, policy.version
     finally:
         db.close()

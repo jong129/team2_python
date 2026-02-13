@@ -12,14 +12,14 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
 from tool import logger
-from document.document import analyze_document, analyze_document_b64
+from document.document import analyze_document,AnalyzeRequest
 from chatbot.chatbot import (
     make_context_from_hits, build_rag_prompt, create_embedding, chat_answer, chat_answer_detail,
     generate_title_from_messages, chroma_add_docs, chroma_search, classify_question,
     build_simple_prompt, generate_followups)
 from chatbot.chatbot_schemas import (
     EmbeddingRequest, EmbeddingResponse, IngestDoc, IngestRequest, AskRequest, AskResponse,
-    RagReference, TitleRequest, TitleResponse, AnalyzeRequest)
+    RagReference, TitleRequest, TitleResponse)
 
 # =========================
 # Checklist AI Services
@@ -336,46 +336,44 @@ def hello():
 # 문서 이미지 분석 : 이미지 경로 또는 base64를 받아서 텍스트/정보를 추출(등기부등본, 계약서 등)
 @app.post("/document/analyze")
 async def analyze_document_endpoint(req: AnalyzeRequest):
+    logger.info(req)
     try:
-        # 1) 분석 수행
-        if req.image_b64:
-            result = analyze_document_b64(req.image_b64)
-        elif req.image_path:
-            result = analyze_document(req.image_path)
+        if req.image_paths:
+            result = analyze_document(req.image_paths)
         else:
             raise HTTPException(status_code=400, detail="image_b64 또는 image_path 필요")
 
-        # 2) doc_id 없으면 만들어서라도 넣기 (없으면 RAG 필터 못 씀)
-        user_id = str(req.user_id) if req.user_id is not None else "anonymous"
-        doc_id = str(req.doc_id) if req.doc_id is not None else f"tmp-{int(time.time())}"
+        # # 2) doc_id 없으면 만들어서라도 넣기 (없으면 RAG 필터 못 씀)
+        # user_id = str(req.user_id) if req.user_id is not None else "anonymous"
+        # doc_id = str(req.doc_id) if req.doc_id is not None else f"tmp-{int(time.time())}"
 
-        doc_type = result.get("doc_type", req.doc_type or "UNKNOWN")
-        risk_score = result.get("risk_score")
-        reasons = result.get("reasons") or []
-        ai_explanation = result.get("ai_explanation") or ""
+#         doc_type = result.get("doc_type", req.doc_type or "UNKNOWN")
+#         risk_score = result.get("risk_score")
+#         reasons = result.get("reasons") or []
+#         ai_explanation = result.get("ai_explanation") or ""
 
-        # 3) Chroma 저장(중요: return 전에!)
-        chroma_add_docs([{
-            "id": f"doc-{user_id}-{doc_id}",
-            "text": f"""문서 유형: {doc_type}
-위험 점수: {risk_score}
-위험 사유:
-{chr(10).join(reasons)}
+#         # 3) Chroma 저장(중요: return 전에!)
+#         chroma_add_docs([{
+#             "id": f"doc-{user_id}-{doc_id}",
+#             "text": f"""문서 유형: {doc_type}
+# 위험 점수: {risk_score}
+# 위험 사유:
+# {chr(10).join(reasons)}
 
-AI 설명:
-{ai_explanation}
-""",
-            "meta": {
-                "doc_type": str(doc_type),
-                "user_id": str(user_id),
-                "doc_id": str(doc_id),
-                "stage": "analysis",
-            },
-        }])
+# AI 설명:
+# {ai_explanation}
+# """,
+#             "meta": {
+#                 "doc_type": str(doc_type),
+#                 "user_id": str(user_id),
+#                 "doc_id": str(doc_id),
+#                 "stage": "analysis",
+#             },
+#         }])
 
-        # 4) 프론트가 doc_id를 저장할 수 있게 결과에도 내려주기(추천)
-        result["user_id"] = user_id
-        result["doc_id"] = doc_id
+#         # 4) 프론트가 doc_id를 저장할 수 있게 결과에도 내려주기(추천)
+#         result["user_id"] = user_id
+#         result["doc_id"] = doc_id
 
         return result
 
