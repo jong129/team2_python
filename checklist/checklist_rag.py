@@ -1,16 +1,36 @@
 # checklist/checklist_rag.py
 
 from typing import List, Dict
+from pydantic import BaseModel
 import json
 import os
+import chromadb
+import hashlib
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.documents import Document
 
 
+# ---------- AI 미리보기 ----------
+class ChecklistAiPreviewRequest(BaseModel):
+    baseItems: List[str]
+    phase: str
+
+class ChecklistAiPreviewResponse(BaseModel):
+    newItems: List[dict]
+
+
+# ---------- AI 개선 요약 ----------
+class ChecklistImproveSummaryRequest(BaseModel):
+    templateId: int
+    previewItems: List[dict]
+    userStats: List[dict]
+    satisfaction: dict
+
+class ChecklistImproveSummaryResponse(BaseModel):
+    summaries: List[dict]
 
 class ChecklistRagService:
     """
@@ -35,37 +55,50 @@ class ChecklistRagService:
         PDF + TXT → Chunk → VectorStore → Retriever → LLM
         """
 
-        # 📘 PDF 로딩
+        # 1️⃣ PDF 로딩
         loader = PyPDFLoader(self.pdf_path)
         pdf_docs = loader.load()
 
-        # 📄 TXT 로딩
+        # 2️⃣ TXT 로딩
         txt_docs = self._load_txt(self.txt_path)
-
-        # 📚 문서 병합 (PDF + TXT 동급)
         all_docs = pdf_docs + txt_docs
 
-        # ✂️ 문서 분할
+        # 3️⃣ Chunk
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=800,
             chunk_overlap=150
         )
         chunks = splitter.split_documents(all_docs)
 
-        # 🔢 임베딩
-        embeddings = OpenAIEmbeddings(
+        # 4️⃣ Embedding
+        self.embeddings = OpenAIEmbeddings(
             openai_api_key=os.getenv("OPENAI_API_KEY")
         )
 
-        # 🧠 벡터 스토어
-        self.vectorstore = FAISS.from_documents(chunks, embeddings)
-
-        # 🔍 Retriever
-        self.retriever = self.vectorstore.as_retriever(
-            search_kwargs={"k": 4}
+        # 5️⃣ Chroma Persistent Client
+        self.chroma = chromadb.Client(
+            chromadb.config.Settings(
+                persist_directory="./chroma_rag",
+                anonymized_telemetry=False
+            )
+        )
+        
+        self.collection = self.chroma.get_or_create_collection(
+            name="checklist_rag"
         )
 
-        # 🤖 LLM
+        # 6️⃣ 문서 적재 (최초 1회 기준, 간단 버전)
+        if self.collection.count() == 0:
+            self.collection.add(
+                documents=[d.page_content for d in chunks],
+                metadatas=[d.metadata for d in chunks],
+                ids=[
+                    "rag_" + hashlib.sha1(d.page_content.encode("utf-8")).hexdigest()
+                    for d in chunks
+                ]
+            )
+
+        # 7️⃣ LLM
         self.llm = ChatOpenAI(
             model="gpt-4o-mini",
             temperature=0.3,
@@ -93,8 +126,13 @@ class ChecklistRagService:
         """
         검색 쿼리에 맞는 PDF 문맥을 가져온다
         """
-        docs = self.retriever.invoke(query)
-        return "\n\n".join([d.page_content for d in docs])
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=4
+        )
+
+        documents = results.get("documents", [[]])[0]
+        return "\n\n".join(documents)
 
     # ==================================================
     # 3️⃣ 기존 기능: 신규 체크리스트 항목 생성
@@ -260,3 +298,88 @@ class ChecklistRagService:
 
         response = self.llm.invoke(prompt).content
         return response.strip()
+    
+    # ==================================================
+    # 5️⃣ API 단위: AI 미리보기
+    # ==================================================
+    def preview(self, req: ChecklistAiPreviewRequest) -> Dict:
+        """
+        /checklist/ai/preview 전용
+        """
+        result = self.generate_new_items(
+            base_items=req.baseItems,
+            phase=req.phase
+        )
+
+        return {
+            "newItems": result.get("new_items", [])
+        }
+        
+    # ==================================================
+    # 6️⃣ API 단위: AI 개선 요약
+    # ==================================================
+    def improve_summary(
+        self,
+        req: ChecklistImproveSummaryRequest
+    ) -> ChecklistImproveSummaryResponse:
+        """
+        /checklist/ai/improve/summary 전용
+        - 개선된 체크리스트 항목별 사유 설명 생성
+        """
+
+        # 1️⃣ 가이드라인 추출
+        guideline_result = self.extract_guidelines()
+        guidelines = guideline_result.get("guidelines", [])
+
+        summaries = []
+
+        # 2️⃣ 항목별 사유 생성
+        for item in req.previewItems:
+            title = item.get("title")
+
+            # 🔍 가장 근접한 가이드라인 매칭
+            guideline = next(
+                (g for g in guidelines if g.get("title") and g["title"] in title),
+                {
+                    "title": "전세 계약 사기 예방 일반 기준",
+                    "importance": "MEDIUM",
+                    "description": "전세 계약 과정에서 반복적으로 문제가 발생하는 주요 위험 요소",
+                    "source": "PDF 종합 가이드"
+                }
+            )
+
+            # 📊 사용자 통계 매칭
+            stat = next(
+                (s for s in req.userStats if s.get("itemTitle") == title),
+                {}
+            )
+
+            # 🧠 사유 설명 생성
+            reason = self.explain_item_reason(
+                guideline=guideline,
+                user_stats=stat,
+                satisfaction=req.satisfaction,
+                preview_item=item
+            )
+
+            summaries.append({
+                "title": title,
+                "reason": reason
+            })
+
+        return ChecklistImproveSummaryResponse(summaries=summaries)
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+rag_service = ChecklistRagService(
+    pdf_path=os.path.join(
+        BASE_DIR,
+        "전세 계약. 두렵지 않아요 전세 사기 예방 A to Z.pdf"
+    ),
+    txt_path=os.path.join(
+        BASE_DIR,
+        "체크리스트_항목.txt"
+    )
+)
+

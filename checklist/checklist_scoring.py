@@ -1,8 +1,29 @@
 # checklist/checklist_scoring.py
 
-from typing import Dict
+from typing import Dict, List
+from pydantic import BaseModel
 import json
 
+from checklist.checklist_rag import rag_service
+
+
+class ChecklistScoreItem(BaseModel):
+    itemId: int
+    title: str
+    description: str
+
+class ChecklistScoreRequest(BaseModel):
+    items: List[ChecklistScoreItem]
+
+class ChecklistScoreResult(BaseModel):
+    itemId: int
+    title: str
+    importanceScore: int
+    reason: str
+
+class ChecklistScoreResponse(BaseModel):
+    riskScore: int
+    scores: List[ChecklistScoreResult]
 
 class ChecklistScoringService:
     """
@@ -38,6 +59,14 @@ class ChecklistScoringService:
         # 🔍 PDF 기반 문맥 검색
         context = self.rag._retrieve_context(query)
 
+        if not context.strip():
+            return {
+                "itemId": item.get("itemId"),
+                "title": item.get("title"),
+                "importanceScore": 30,
+                "reason": "공공 가이드 문서에서 해당 항목과 직접적으로 연관된 내용을 찾기 어려움"
+            }
+        
         prompt = f"""
 너는 전세 사기 예방을 위한
 공공 가이드 문서를 분석하는 전문가다.
@@ -79,18 +108,20 @@ class ChecklistScoringService:
         response = self.llm.invoke(prompt).content.strip()
 
         try:
-            result = json.loads(response)
+                result = json.loads(response)
+                raw_score = float(result.get("importanceScore", 0.5))  # 0.0 ~ 1.0
         except Exception:
-            # ⚠️ 파싱 실패 시 보수적 기본값
-            result = {
-                "importanceScore": 0.5,
-                "reason": "문서와의 연관성을 명확히 판단하지 못함"
-            }
+                raw_score = 0.5
+                result = {
+                    "reason": "문서와의 연관성을 명확히 판단하지 못함"
+                }
+
+        score_100 = int(round(raw_score * 100))
 
         return {
             "itemId": item.get("itemId"),
             "title": item.get("title"),
-            "importanceScore": round(float(result.get("importanceScore", 0.5)), 2),
+            "importanceScore": score_100,
             "reason": result.get("reason", "")
         }
 
@@ -108,6 +139,44 @@ class ChecklistScoringService:
             scored = self.score_item(item)
             results.append(scored)
 
+        # ============================
+        # ✅ 100점 만점 정규화 점수
+        # ============================
+        if results:
+            avg_score = round(
+                sum(r["importanceScore"] for r in results) / len(results)
+            )
+        else:
+            avg_score = 0
+
         return {
+            "riskScore": avg_score,   # ⭐ 항상 0~100
             "scores": results
         }
+        
+    # ==================================================
+    # 3️⃣ API 단위: 중요도 스코어링
+    # ==================================================
+    def score(self, req: ChecklistScoreRequest) -> ChecklistScoreResponse:
+        """
+        /checklist/ai/score 전용 엔트리포인트
+        """
+
+        items = [
+            {
+                "itemId": i.itemId,
+                "title": i.title,
+                "description": i.description,
+            }
+            for i in req.items
+        ]
+
+        result = self.score_items(items)
+
+        return ChecklistScoreResponse(
+            riskScore=result["riskScore"],
+            scores=result["scores"]
+        )
+
+
+scoring_service = ChecklistScoringService(rag_service)
